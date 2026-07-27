@@ -1,0 +1,12 @@
+# SAR Dataset Configuration for YOLOv12
+# Dataset name
+path: ./datasets/sar_dataset  # dataset root dir
+train: images/train  # train images (relative to 'path')
+val: images/val  # val images (relative to 'path')
+
+# Classes
+names:
+  0: ship
+
+# Dataset statistics
+nc: 1  # number of classes

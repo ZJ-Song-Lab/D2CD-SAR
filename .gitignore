@@ -1,0 +1,55 @@
+build/
+dist/
+*.egg-info/
+**/__pycache__/
+
+**/.ipynb_checkpoints
+**/.ipynb_checkpoints/**
+
+**/notebooks
+
+# Ignore swap files
+*.swp
+
+# Ignore IDE directories
+.vscode/
+.idea/
+
+# ---- Python virtual environments ----
+env/
+venv/
+.venv/
+env*/
+
+# ---- Datasets (licensed, not redistributed) ----
+# SSDD / HRSID images and annotations are downloaded from official sources
+dinov3/data/SSDD/images/
+dinov3/data/SSDD/labels/
+dinov3/data/SSDD/labels_hbb/
+dinov3/data/SSDD/labels_obb/
+dinov3/data/SSDD/trans_obb/Annotations/
+dinov3/data/SSDD/trans_obb/Annotations_train/
+dinov3/data/HRSID/images/
+dinov3/data/HRSID/Annotations/
+dinov3/data/LS-SSDD-v1.0/
+**/*.cache
+
+# ---- Model weights / checkpoints ----
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+*.bin
+*.onnx
+*.om
+outputs/
+runs/
+logs/
+wandb/
+**/events.out.tfevents.*
+
+# ---- Secrets / credentials ----
+*.env
+.env
+secrets/
+credentials.json
