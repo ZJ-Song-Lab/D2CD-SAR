@@ -23,6 +23,8 @@ Defaults follow the paper's Implementation Details:
 import os
 import sys
 import argparse
+import random
+import numpy as np
 from collections import defaultdict
 from pathlib import Path
 
@@ -44,6 +46,18 @@ from dinov3.data.SSDD.transforms import (
     DATASET_STATS,
 )
 from dinov3.data.HRSID.hrsid_dataset import HRSIDDataset
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+def set_seed(seed: int):
+    """Seed Python, NumPy and PyTorch (CPU + CUDA) for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +256,7 @@ def build_optimizer(distiller, lr, weight_decay):
 def main(args):
     if args.data_root is None:
         args.data_root = f"./dinov3/data/{args.dataset.upper()}"
+    set_seed(args.seed)
     rank, world_size, gpu = setup_distributed()
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -249,6 +264,7 @@ def main(args):
         print("=== SAR-RTDETR cross-modal distillation ===")
         print(f"Dataset: {args.dataset}, Data root: {args.data_root}")
         print(f"World size: {world_size}, Rank: {rank}, Device: {device}")
+        print(f"Seed: {args.seed}")
         print(f"Arguments: {args}")
 
     norm_mean, norm_std = DATASET_STATS[args.dataset]
@@ -332,7 +348,9 @@ def main(args):
         torch.save({"student": deploy_student.state_dict(),
                     "num_classes": args.num_classes,
                     "num_queries": args.num_queries,
-                    "gate_value": core.gate.value()},
+                    "gate_value": core.gate.value(),
+                    "seed": args.seed,
+                    "epoch": args.epochs},
                    output_dir / "deploy_student.pth")
         print(f"Deployment student saved to {output_dir / 'deploy_student.pth'} "
               f"(LoRA merged, final gate w={core.gate.value():.4f}).", flush=True)
@@ -372,5 +390,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", default=4, type=int)
     parser.add_argument("--print-freq", default=50, type=int)
     parser.add_argument("--save-freq", default=10, type=int)
+    parser.add_argument("--seed", default=42, type=int,
+                        help="Random seed for reproducible training (paper reports mean ± std over multiple seeds)")
     args = parser.parse_args()
     main(args)

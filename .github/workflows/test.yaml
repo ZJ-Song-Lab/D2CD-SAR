@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  run-smoke-tests:
+    name: Run smoke tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "**/requirements*.txt"
+
+      - name: Install runtime dependencies (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pytest numpy
+
+      - name: Install package (editable, no build isolation issues)
+        run: |
+          pip install -e . --no-deps || true
+
+      - name: Run smoke tests (pytest)
+        run: |
+          python -m pytest dinov3/sar_detection/test_smoke.py -v
+
+      - name: Run smoke tests (direct module fallback)
+        if: always()
+        run: |
+          python -m dinov3.sar_detection.test_smoke

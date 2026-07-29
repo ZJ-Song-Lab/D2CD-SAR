@@ -90,6 +90,18 @@ class SARRTDETRDistiller(nn.Module):
         self.teacher = self._build_teacher(teacher_pretrained, teacher_weights)
         self.embed_dim = self.teacher.embed_dim
 
+        self.teacher_blocks = [2, 5, 8, 11]
+        self.teacher_projectors = nn.ModuleList([
+            nn.Conv2d(self.embed_dim, self.embed_dim, kernel_size=1, bias=True)
+            for _ in self.teacher_blocks
+        ])
+        for proj in self.teacher_projectors:
+            with torch.no_grad():
+                proj.weight.copy_(
+                    torch.eye(self.embed_dim).unsqueeze(-1).unsqueeze(-1) * 0.25
+                )
+                nn.init.zeros_(proj.bias)
+
         # --- DRCP (feature-level alignment) ---
         drcp_kwargs = dict(drcp_kwargs or {})
         self.drcp = DRCP(
@@ -108,11 +120,22 @@ class SARRTDETRDistiller(nn.Module):
             p.requires_grad_(False)
         return teacher
 
-    @torch.no_grad()
     def _teacher_features(self, images: torch.Tensor) -> torch.Tensor:
-        """Dense patch-level teacher features F_tea^sp [B, C_t, Ht, Wt]."""
-        feats = self.teacher.get_intermediate_layers(images, n=1, reshape=True, norm=True)
-        f_tea = feats[0]  # deepest layer, reshaped to 2D
+        """Dense patch-level teacher features F_tea^sp [B, C_t, Ht, Wt].
+
+        Patch tokens are extracted from DINOv3-ViT-B transformer blocks
+        {3,6,9,12} (1-indexed; ``self.teacher_blocks`` stores the 0-based
+        indices) and mapped by the learned 1x1 ``teacher_projectors`` to the
+        common alignment interface. The projected blocks are summed to form the
+        candidate teacher target F_tea^sp (paper Sec. 3.1, "Teacher Feature
+        Extraction").
+        """
+        with torch.no_grad():
+            feats = self.teacher.get_intermediate_layers(
+                images, n=self.teacher_blocks, reshape=True, norm=True
+            )
+        projected = [proj(f) for proj, f in zip(self.teacher_projectors, feats)]
+        f_tea = torch.stack(projected, dim=0).sum(dim=0)
         return f_tea.float()
 
     # ----------------------------------------------------------- box utilities
@@ -210,7 +233,7 @@ class SARRTDETRDistiller(nn.Module):
         sar_gray = self._sar_intensity(images)
         obb_norm = self._normalize_obb_for_drcp(targets, H, W)
         f_tea_hat, loss_drcp = self.drcp(
-            [outputs_distill["s3"], outputs_distill["s4"], outputs_distill["f5"]],
+            [outputs_distill["s3"], outputs_distill["s4"], outputs_distill["s5"]],
             f_tea,
             obb_norm,
             sar_gray,

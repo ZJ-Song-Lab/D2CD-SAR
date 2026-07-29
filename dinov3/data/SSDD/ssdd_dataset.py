@@ -5,18 +5,23 @@
 
 """
 SSDD Dataset for SAR Ship Detection
-Dataset format: YOLO OBB (Oriented Bounding Box)
+Dataset format: native HBB (Horizontal Bounding Box), YOLO cxcywh.
 
-Implements hash-based deduplication and disjoint splitting to prevent
-data leakage between train/val/test.  OBB corner coordinates are preserved
-in target["obb"] (pixel space) for the DRCP direction-aware soft mask.
+Scene-disjoint partitioning (paper 4.1): the official SSDD release ships
+``images/{train,val,test}/`` sub-directories that are scene-disjoint by
+construction -- no image from a scene in *train* appears in *val* or
+*test*.  The loader honours this on-disk layout directly.  A flat-layout
+fallback groups images by a scene key extracted from the filename and
+splits *by scene* (not by single image) so every image of a scene lands
+in the same split.  HBB labels are preserved in target["boxes"] (cxcywh,
+pixel); axis-aligned OBB corners derived from the HBB are kept in
+target["obb"] for the DRCP direction-aware soft mask (the derivation is
+lossless because an HBB *is* an axis-aligned OBB).
 """
 
 import json
-import hashlib
-import os
+import re
 import torch
-import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -24,20 +29,26 @@ from pathlib import Path
 
 class SSDDDataset(Dataset):
     """
-    SSDD Dataset for oriented bounding box detection.
-    Format: class_id x1 y1 x2 y2 x3 y3 x4 y4 (normalized coordinates)
+    SSDD Dataset for horizontal bounding box detection.
+    Native label format: ``class_id cx cy w h`` (normalized).
 
-    The existing on-disk train/val/test sub-directories leak images (val
-    and test are literal copies of train files).  To guarantee disjoint
-    splits we gather *all* labelled images across the three sub-folders,
-    hash each file, deduplicate by hash, sort by hash, and cut into
-    80 / 10 / 10.  The resulting manifest is cached as
+    Scene-disjoint partitioning
+    ---------------------------
+    Primary path: the on-disk ``images/<split>/`` sub-directory is used
+    verbatim -- the official SSDD sub-directories are scene-disjoint by
+    construction, so honouring them guarantees scene isolation.
+
+    Flat-layout fallback: when no ``images/<split>/`` sub-directory exists,
+    images are grouped by a *scene key* (the non-numeric prefix before the
+    trailing id in the filename, e.g. ``sceneA_0001`` -> ``sceneA``; plain
+    numeric ids such as ``0001`` -> ``""`` singleton scenes) and *scenes*
+    (not single images) are sorted and cut 80 / 10 / 10 so every image of
+    a scene lands in the same split.  The resulting manifest is cached as
     ``ssdd_splits.json`` next to the dataset root so that every run uses
     the same split.
 
     Images without a corresponding label file are silently dropped so
-    that the loader never emits an empty-target sample (the original
-    1160-vs-928 mismatch).
+    that the loader never emits an empty-target sample.
     """
 
     SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
@@ -62,81 +73,94 @@ class SSDDDataset(Dataset):
         self.max_size = max_size
 
         self.image_dir = self.root_dir / "images"
-        self.label_dir = self.root_dir / "labels"
+        # Native HBB labels (paper: SSDD uses native HBB, not YOLO OBB).
+        # Prefer an explicit ``labels_hbb/`` dir when present, else the
+        # conventional ``labels/`` dir which stores cxcywh HBB for SSDD.
+        hbb_dir = self.root_dir / "labels_hbb"
+        self.label_dir = hbb_dir if hbb_dir.is_dir() else self.root_dir / "labels"
 
         # Class names (only ship in SSDD)
         self.class_names = ["ship"]
         self.num_classes = len(self.class_names)
 
-        self.image_files = self._build_disjoint_split()
+        self.image_files = self._build_scene_disjoint_split()
 
     # ------------------------------------------------------------------
-    # Hash-based deduplication + disjoint split
+    # Scene-disjoint partitioning
     # ------------------------------------------------------------------
     @staticmethod
-    def _md5(path: Path) -> str:
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
+    def _scene_key(path: Path) -> str:
+        """Extract a coarse scene/group key from a filename.
 
-    def _build_disjoint_split(self):
-        """Return the list of image paths for *this* split.
-
-        All labelled images across train/val/test are gathered, hashed,
-        and deduplicated.  Sorting by hash then splitting 80/10/10 yields
-        a deterministic, leak-free partition.  The result is cached in
-        ``ssdd_splits.json``.
+        Filenames such as ``sceneA_0001.jpg`` or ``sceneA-0001.jpg`` map to
+        ``sceneA``; plain numeric ids such as ``0001.jpg`` map to ``""``
+        (each treated as its own singleton scene, which degrades
+        gracefully to a deterministic per-image cut only when no real
+        scene key is available).
         """
+
+        stem = path.stem
+        m = re.match(r"^(.*?)[_-]?\d+$", stem)
+        if m and m.group(1):
+            return m.group(1)
+        return ""
+
+    @staticmethod
+    def _label_path_for(label_dir: Path, img_path: Path) -> Path:
+        """Mirror the image sub-directory under the label directory."""
+        sub = img_path.parent.name
+        if sub in ("train", "val", "test"):
+            return label_dir / sub / f"{img_path.stem}.txt"
+        return label_dir / f"{img_path.stem}.txt"
+
+    def _build_scene_disjoint_split(self):
+        """Return image paths for this split, guaranteeing scene isolation."""
+        split_subdir = self.image_dir / self.split
+        if split_subdir.is_dir():
+            files = []
+            for img_path in sorted(split_subdir.glob("*.jpg")):
+                if self._label_path_for(self.label_dir, img_path).exists():
+                    files.append(img_path)
+            if files:
+                return files
+
         manifest_path = self.root_dir / "ssdd_splits.json"
         if manifest_path.exists():
             with open(manifest_path, "r") as f:
                 manifest = json.load(f)
             return [Path(p) for p in manifest[self.split]]
 
-        all_images = []
-        seen_hashes = {}
-        for sub in ("train", "val", "test"):
-            img_subdir = self.image_dir / sub
-            if not img_subdir.exists():
+        scenes = {}
+        for img_path in sorted(self.image_dir.glob("*.jpg")):
+            if not self._label_path_for(self.label_dir, img_path).exists():
                 continue
-            for img_path in sorted(img_subdir.glob("*.jpg")):
-                label_path = self.label_dir / sub / f"{img_path.stem}.txt"
-                if not label_path.exists():
-                    continue
-                h = self._md5(img_path)
-                if h in seen_hashes:
-                    continue
-                seen_hashes[h] = img_path
-                all_images.append((h, str(img_path)))
+            key = self._scene_key(img_path)
+            scenes.setdefault(key, []).append(str(img_path))
 
-        all_images.sort(key=lambda x: x[0])
-        n = len(all_images)
+        scene_keys = sorted(scenes.keys())
+        n = len(scene_keys)
         n_train = int(n * self.SPLIT_RATIOS["train"])
         n_val = int(n * self.SPLIT_RATIOS["val"])
-        splits = {
-            "train": [p for _, p in all_images[:n_train]],
-            "val": [p for _, p in all_images[n_train:n_train + n_val]],
-            "test": [p for _, p in all_images[n_train + n_val:]],
-        }
+        splits = {"train": [], "val": [], "test": []}
+        for i, key in enumerate(scene_keys):
+            if i < n_train:
+                splits["train"].extend(scenes[key])
+            elif i < n_train + n_val:
+                splits["val"].extend(scenes[key])
+            else:
+                splits["test"].extend(scenes[key])
         with open(manifest_path, "w") as f:
             json.dump(splits, f, indent=2)
         return [Path(p) for p in splits[self.split]]
-
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, idx):
-        # Load image
         img_path = self.image_files[idx]
         image = Image.open(img_path).convert("RGB")
         orig_w, orig_h = image.size
 
-        # The label file mirrors the image sub-directory:
-        # images/<sub>/<stem>.jpg -> labels/<sub>/<stem>.txt
-        sub = img_path.parent.name
-        label_path = self.label_dir / sub / f"{img_path.stem}.txt"
+        label_path = self._label_path_for(self.label_dir, img_path)
         boxes = []
         labels = []
         obb_corners = []
@@ -145,30 +169,27 @@ class SSDDDataset(Dataset):
             with open(label_path, "r") as f:
                 for line in f:
                     parts = line.strip().split()
-                    if len(parts) == 9:  # class_id + 8 coordinates
-                        class_id = int(parts[0])
-                        coords = [float(x) for x in parts[1:]]
-                        x_coords = [c * orig_w for c in coords[0::2]]
-                        y_coords = [c * orig_h for c in coords[1::2]]
+                    if len(parts) != 5:
+                        continue
+                    class_id = int(parts[0])
+                    cx_n, cy_n, w_n, h_n = (float(x) for x in parts[1:])
 
-                        # Preserve OBB corners (pixel) for DRCP W_soft.
-                        corners = []
-                        for px, py in zip(x_coords, y_coords):
-                            corners.extend([px, py])
-                        obb_corners.append(corners)
+                    cx = cx_n * orig_w
+                    cy = cy_n * orig_h
+                    w = w_n * orig_w
+                    h = h_n * orig_h
 
-                        # Axis-aligned bounding box (cxcywh, pixel).
-                        x_min, x_max = min(x_coords), max(x_coords)
-                        y_min, y_max = min(y_coords), max(y_coords)
-                        cx = (x_min + x_max) / 2
-                        cy = (y_min + y_max) / 2
-                        w = x_max - x_min
-                        h = y_max - y_min
+                    boxes.append([cx, cy, w, h])
+                    labels.append(class_id)
 
-                        boxes.append([cx, cy, w, h])
-                        labels.append(class_id)
+                    xmin = cx - w / 2.0
+                    xmax = cx + w / 2.0
+                    ymin = cy - h / 2.0
+                    ymax = cy + h / 2.0
+                    obb_corners.append(
+                        [xmin, ymin, xmax, ymin, xmax, ymax, xmin, ymax]
+                    )
 
-        # Convert to tensors
         if len(boxes) > 0:
             boxes = torch.tensor(boxes, dtype=torch.float32)
             labels = torch.tensor(labels, dtype=torch.long)

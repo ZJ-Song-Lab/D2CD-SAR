@@ -207,6 +207,10 @@ class RTDETRHead(nn.Module):
     def __init__(self, num_queries, num_classes, d_model, nhead, dim_feedforward, num_layers, dropout=0.0):
         super().__init__()
         self.num_queries = num_queries
+        self.d_model = d_model
+        # d_model*2 stores [positional half | content half]; forward splits them
+        # so both the query positional encoding and the initial content query are
+        # d_model-dimensional (standard DETR query embedding).
         self.query_embed = nn.Embedding(num_queries, d_model * 2)
         self.decoder = nn.ModuleList(
             [DETRDecoderLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)]
@@ -216,8 +220,11 @@ class RTDETRHead(nn.Module):
 
     def forward(self, memory, pos, mem_mask=None):
         bs = memory.shape[0]
-        query_pos = self.query_embed.weight[: self.num_queries].unsqueeze(0).expand(bs, -1, -1)
-        tgt = torch.zeros_like(query_pos)
+        query_pos, tgt = torch.split(
+            self.query_embed.weight[: self.num_queries], self.d_model, dim=1
+        )
+        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+        tgt = tgt.unsqueeze(0).expand(bs, -1, -1).contiguous()
         for layer in self.decoder:
             tgt = layer(tgt, query_pos, memory, pos, q_mask=None, k_mask=mem_mask)
         logits = self.class_embed(tgt)
@@ -304,7 +311,7 @@ class RTDETRStudent(nn.Module):
         pos = torch.cat(pos, dim=1)
         mem_mask = torch.cat(masks, dim=1)
         out = self.head(memory, pos, mem_mask)
-        out["s3"], out["s4"], out["f5"] = s3, s4, f5
+        out["s3"], out["s4"], out["s5"], out["f5"] = s3, s4, s5, f5
         return out
 
 
@@ -441,7 +448,8 @@ class PostProcess(nn.Module):
     def forward(self, outputs, target_sizes):
         out_logits, out_boxes = outputs["pred_logits"], outputs["pred_boxes"]
         prob = out_logits.sigmoid()
-        topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), 100, dim=1)
+        num_total = prob.shape[1] * prob.shape[2]
+        topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), min(100, num_total), dim=1)
         topk_boxes = topk_indexes // out_logits.shape[2]
         labels = topk_indexes % out_logits.shape[2]
         boxes = out_boxes.gather(1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))

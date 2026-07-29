@@ -39,9 +39,9 @@ class DRCP(nn.Module):
     Args:
         C_t: teacher channel dimension (DINOv3-ViT-B -> 768).
         student_dims: channel dims of the routed student levels
-            (e.g. (C3, C4, C5) = (128, 256, 512) for RT-DETR-R18). The deepest
-            level is the AIFI output F5 so the distillation branch receives
-            gradient from L_DRCP.
+            (e.g. (C3, C4, C5) = (128, 256, 512) for RT-DETR-R18). The routed
+            levels are the backbone features {S3, S4, S5}; F5 (AIFI output) is
+            used by the detection branch, not by DRCP.
         K_window: scattering-energy averaging window (pixels).
         mu: background soft-mask magnitude outside OBBs.
         sigma: background soft-mask Gaussian bandwidth.
@@ -192,7 +192,7 @@ class DRCP(nn.Module):
         sar_gray: torch.Tensor,
     ):
         """Args:
-            student_features: list [S3, S4, F5] (deepest is the AIFI output).
+            student_features: list [S3, S4, S5] (backbone feature hierarchy).
             f_tea: teacher patch features [B, C_t, Ht, Wt].
             obb_norm: per-image list of OBB corner tensors [N, 8] (normalized
                 xy-pairs in [0, 1]) for the anisotropic W_soft (Eq. 9-11).
@@ -218,8 +218,8 @@ class DRCP(nn.Module):
         # clamped to avoid division-by-near-zero in masked regions.
         a = f_tea_hat.flatten(2)  # [B, C_t, HW]
         b = f_stu_routed.flatten(2)  # [B, C_t, HW]
-        a_norm = a.norm(dim=1, keepdim=True).clamp(min=1e-6)  # [B, 1, HW]
-        b_norm = b.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        a_norm = a.norm(dim=1).clamp(min=1e-6)  # [B, HW]
+        b_norm = b.norm(dim=1).clamp(min=1e-6)  # [B, HW]
         cos = (a * b).sum(dim=1) / (a_norm * b_norm)  # [B, HW]
         weight = w_soft.flatten(2).squeeze(1)  # [B, HW]
         loss = (weight * (1.0 - cos)).sum(dim=1) / (weight.sum(dim=1) + 1e-6)

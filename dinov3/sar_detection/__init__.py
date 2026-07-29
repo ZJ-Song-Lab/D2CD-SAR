@@ -15,6 +15,7 @@ Both models are pretrained on satellite imagery (SAT-493M).
 
 # ViT-L/16 imports
 from .train import main as train_main
+from .evaluate import main as evaluate_main
 from .inference import detect, visualize_detection, visualize_heatmap
 
 # ViT-7B/16 imports
@@ -26,6 +27,7 @@ from .inference_vit7b import visualize_heatmap as visualize_heatmap_vit7b
 __all__ = [
     # ViT-L/16
     "train_main",
+    "evaluate_main",
     "detect",
     "visualize_detection",
     "visualize_heatmap",
