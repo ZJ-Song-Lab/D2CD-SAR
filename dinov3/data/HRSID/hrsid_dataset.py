@@ -18,7 +18,7 @@ corners required by DRCP's direction-aware soft mask (Eq. 9-11) from the
 **minimum-area bounding rectangle** of the instance polygon.  This is an
 explicit, documented *derived* annotation, not a native one::
 
-    polygon  ->  convex hull  ->  rotating-calipers min-area rect  ->  4 OBB corners
+    COCO bbox  ->  axis-aligned HBB (cxcywh)
 
 The conversion is implemented in pure NumPy (``_min_area_rect``) so the
 loader has no OpenCV dependency.  The horizontal bounding box (``boxes``,
@@ -33,15 +33,13 @@ the COCO JSON whose name matches the requested split (e.g.
 hash-based re-cutting.
 
 A PASCAL-VOC XML fallback is retained for layouts that only ship HBB XML;
-in that case OBB corners are derived from the axis-aligned HBB (an HBB is
-an axis-aligned OBB).
+in that case the axis-aligned HBB is used directly.
 
 Target dict (same interface as ``SSDDDataset``)::
 
     boxes:     FloatTensor[N, 4]   # cxcywh, pixel space
     labels:    LongTensor [N]      # 0 = ship
-    obb:       FloatTensor[N, 8]   # 4 corner xy-pairs, pixel space,
-                                  # DERIVED from polygon min-area rect
+    # (no obb field — HBB is in boxes)
     image_id:  tensor([idx])
     orig_size: tensor([H, W])
 """
@@ -452,16 +450,16 @@ class HRSIDDataset(Dataset):
         if len(boxes) > 0:
             boxes = torch.tensor(boxes, dtype=torch.float32)
             labels = torch.tensor(labels, dtype=torch.long)
-            obb = torch.tensor(obb_corners, dtype=torch.float32)
+            # HBB only — no OBB derivation (paper: "COCO HBB")
         else:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.long)
-            obb = torch.zeros((0, 8), dtype=torch.float32)
+            # (no obb — empty annotations)
 
         target = {
             "boxes": boxes,
             "labels": labels,
-            "obb": obb,
+            # (no obb field)
             "image_id": torch.tensor([idx]),
             "orig_size": torch.tensor([orig_h, orig_w]),
         }

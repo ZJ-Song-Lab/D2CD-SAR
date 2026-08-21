@@ -193,16 +193,13 @@ class SSDDDataset(Dataset):
         if len(boxes) > 0:
             boxes = torch.tensor(boxes, dtype=torch.float32)
             labels = torch.tensor(labels, dtype=torch.long)
-            obb = torch.tensor(obb_corners, dtype=torch.float32)
         else:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.long)
-            obb = torch.zeros((0, 8), dtype=torch.float32)
 
         target = {
             "boxes": boxes,
             "labels": labels,
-            "obb": obb,
             "image_id": torch.tensor([idx]),
             "orig_size": torch.tensor([orig_h, orig_w]),
         }

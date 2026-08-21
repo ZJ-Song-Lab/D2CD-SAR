@@ -7,8 +7,8 @@
 
 Contains:
   * ResNet-18 backbone producing {S3, S4, S5} (strides 8 / 16 / 32).
-  * Hybrid encoder: AIFI (single-scale transformer on S5, FFN linears are
-    A^2TD-LoRA modules) + CCFF (top-down multi-scale fusion).
+  * Hybrid encoder: AIFI (single-scale transformer on S5, attention output
+    projection is an A^2TD-LoRA module) + CCFF (top-down multi-scale fusion).
   * DETR-style decoder producing {pred_logits, pred_boxes}.
   * HungarianMatcher + SetCriterion (focal classification + L1 + GIoU),
     providing L_cls and L_box used by the paper's total loss.
@@ -89,28 +89,50 @@ class ResNet18Backbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# AIFI encoder (FFN uses A^2TD-LoRA)
+# AIFI encoder (attention output projection uses A^2TD-LoRA)
 # ---------------------------------------------------------------------------
+class Attention(nn.Module):
+    """Multi-head self-attention with separable output projection."""
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.in_proj = nn.Linear(d_model, 3 * d_model)
+        self.dropout = dropout
+
+    def forward(self, q, k, v):
+        B, N, C = q.shape
+        qkv = self.in_proj(q)  # project then chunk (standard MHA)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.reshape(B, N, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, N, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, N, self.nhead, self.head_dim).transpose(1, 2)
+        scale = self.head_dim ** -0.5
+        attn = torch.softmax((q @ k.transpose(-2, -1)) * scale, dim=-1)
+        attn = F.dropout(attn, p=self.dropout, training=self.training)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return out
+
+
 class AIFIIEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, gate: VarianceGate, r: int, dropout=0.0):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.linear1 = ATDLoRALinear(nn.Linear(d_model, dim_feedforward), r, r, gate)
-        self.linear2 = ATDLoRALinear(nn.Linear(dim_feedforward, d_model), r, r, gate)
+        self.self_attn = Attention(d_model, nhead, dropout)
+        self.attn_out_proj = ATDLoRALinear(nn.Linear(d_model, d_model), r, r, gate)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.activation = nn.GELU()
 
     def forward(self, src, pos, detach_distill=False, detach_det=False):
-        q = k = src + pos
-        sa, _ = self.self_attn(q, k, value=src, need_weights=False)
+        q = k = v = src + pos
+        sa = self.self_attn(q, k, v)
+        sa = self.attn_out_proj(sa, detach_distill=detach_distill, detach_det=detach_det)
         src = self.norm1(src + self.dropout(sa))
-        ff_in = self.linear1(src, detach_distill=detach_distill, detach_det=detach_det)
-        ff = self.linear2(
-            self.dropout(self.activation(ff_in)),
-            detach_distill=detach_distill, detach_det=detach_det,
-        )
+        ff = self.linear2(self.dropout(self.activation(self.linear1(src))))
         src = self.norm2(src + self.dropout(ff))
         return src
 
@@ -208,10 +230,11 @@ class RTDETRHead(nn.Module):
         super().__init__()
         self.num_queries = num_queries
         self.d_model = d_model
-        # d_model*2 stores [positional half | content half]; forward splits them
-        # so both the query positional encoding and the initial content query are
-        # d_model-dimensional (standard DETR query embedding).
-        self.query_embed = nn.Embedding(num_queries, d_model * 2)
+        self.num_classes = num_classes
+        # RT-DETR query selection: top-k encoder-memory positions scored by
+        # a class-aware linear, with learned positional embedding.
+        self.query_selection = nn.Linear(d_model, num_classes)
+        self.query_pos_embed = nn.Embedding(num_queries, d_model)
         self.decoder = nn.ModuleList(
             [DETRDecoderLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)]
         )
@@ -220,11 +243,14 @@ class RTDETRHead(nn.Module):
 
     def forward(self, memory, pos, mem_mask=None):
         bs = memory.shape[0]
-        query_pos, tgt = torch.split(
-            self.query_embed.weight[: self.num_queries], self.d_model, dim=1
-        )
-        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
-        tgt = tgt.unsqueeze(0).expand(bs, -1, -1).contiguous()
+        # Query selection: score memory, pick top-k as initial content queries.
+        cls_score = self.query_selection(memory)  # [B, N, num_classes]
+        k = min(self.num_queries, cls_score.shape[1])
+        topk_score, topk_idx = torch.topk(cls_score.flatten(1), k, dim=1)
+        mem_idx = topk_idx // self.num_classes  # [B, k]
+        gather_idx = mem_idx.unsqueeze(-1).expand(-1, -1, self.d_model)
+        tgt = torch.gather(memory, 1, gather_idx)  # [B, k, C]
+        query_pos = self.query_pos_embed.weight[:k].unsqueeze(0).expand(bs, -1, -1)
         for layer in self.decoder:
             tgt = layer(tgt, query_pos, memory, pos, q_mask=None, k_mask=mem_mask)
         logits = self.class_embed(tgt)
@@ -258,7 +284,7 @@ class RTDETRStudent(nn.Module):
         dim_feedforward: int = 1024,
         enc_layers: int = 1,
         dec_layers: int = 3,
-        r_lora: int = 16,
+        r_lora: int = 100,
         backbone_pretrained: bool = True,
         freeze_backbone: bool = True,
     ):
@@ -275,8 +301,7 @@ class RTDETRStudent(nn.Module):
     def atd_modules(self):
         mods = []
         for layer in self.aifi.layers:
-            mods.append(layer.linear1)
-            mods.append(layer.linear2)
+            mods.append(layer.attn_out_proj)
         return mods
 
     def forward(self, samples, detach_distill=False, detach_det=False, backbone_features=None):
@@ -290,8 +315,8 @@ class RTDETRStudent(nn.Module):
         # batch_first=True: need [B, HW, C]
         pos5 = get_2d_sine_pos(h5, w5, self.d_model, p5.device)  # [HW, C]
         pos5 = pos5.unsqueeze(0).expand(b, -1, -1)  # [B, HW, C]
-        f5_seq = p5.flatten(2).permute(0, 2, 1)  # [B, HW, C]
-        f5_seq = self.aifi(f5_seq, pos5, detach_distill=detach_distill, detach_det=detach_det)
+        z = p5.flatten(2).permute(0, 2, 1)  # AIFI input activation z = Flatten(S5)
+        f5_seq = self.aifi(z, pos5, detach_distill=detach_distill, detach_det=detach_det)
         f5 = f5_seq.permute(0, 2, 1).reshape(b, self.d_model, h5, w5)  # [B, C, H, W]
         # CCFF fuses {S3, S4, F5}.
         feats = self.ccff([s3, s4, f5])
@@ -312,6 +337,7 @@ class RTDETRStudent(nn.Module):
         mem_mask = torch.cat(masks, dim=1)
         out = self.head(memory, pos, mem_mask)
         out["s3"], out["s4"], out["s5"], out["f5"] = s3, s4, s5, f5
+        out["z"] = z  # AIFI input activation for gradient probes (Eq. activation_probes)
         return out
 
 
@@ -462,7 +488,7 @@ class PostProcess(nn.Module):
         return results
 
 
-def build_student(num_classes=1, num_queries=300, r_lora=16, backbone_pretrained=True, freeze_backbone=True):
+def build_student(num_classes=1, num_queries=300, r_lora=100, backbone_pretrained=True, freeze_backbone=True):
     student = RTDETRStudent(
         num_classes=num_classes,
         num_queries=num_queries,

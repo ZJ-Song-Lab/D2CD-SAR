@@ -66,13 +66,59 @@ def _iou_xyxy(b1, b2):
     return inter / (a1[:, None] + a2[None, :] - inter + 1e-6)
 
 
-def compute_map(gt_by_img, det_list, num_classes, device, max_dets=300):
-    """COCO-style mAP@[.5:.95] and AP50.
+def _compute_map_coco(gt_by_img, det_list, num_classes, device, max_dets=300):
+    """Standard pycocotools COCO evaluator (AP@.5:.95, AP50)."""
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+    import itertools
 
-    Args:
-        gt_by_img: {img_id: {"boxes": cxcywh pixel, "labels": [...]}}
-        det_list:  [(img_id, score, xyxy pixel, label), ...]
-    """
+    images = []
+    annotations = []
+    ann_id = 0
+    for iid, gt in gt_by_img.items():
+        boxes = gt["boxes"].cpu()
+        labels = gt["labels"].cpu()
+        H = W = 896  # default; area-based AP not used for primary endpoints
+        images.append({"id": int(iid), "width": W, "height": H})
+        for b in range(boxes.shape[0]):
+            cx, cy, w, h = boxes[b].tolist()
+            cat = int(labels[b].item())
+            annotations.append({
+                "id": ann_id, "image_id": int(iid),
+                "category_id": cat + 1,
+                "bbox": [cx - w / 2, cy - h / 2, w, h],
+                "area": float(w * h), "iscrowd": 0,
+            })
+            ann_id += 1
+
+    categories = [{"id": c + 1, "name": str(c)} for c in range(num_classes)]
+    coco_gt = COCO()
+    coco_gt.dataset = {"images": images, "annotations": annotations, "categories": categories}
+    coco_gt.createIndex()
+
+    coco_dt = []
+    for iid, score, box, label in det_list:
+        x1, y1, x2, y2 = box.tolist()
+        coco_dt.append({
+            "image_id": int(iid),
+            "category_id": int(label) + 1,
+            "bbox": [x1, y1, x2 - x1, y2 - y1],
+            "score": float(score),
+        })
+
+    if not coco_dt:
+        return {"mAP": 0.0, "AP50": 0.0}
+
+    coco_eval = COCOeval(coco_gt, coco_gt.loadRes(coco_dt), "bbox")
+    coco_eval.params.maxDets = [max_dets]
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+    return {"mAP": float(coco_eval.stats[0]), "AP50": float(coco_eval.stats[1])}
+
+
+def _compute_map_pr_area(gt_by_img, det_list, num_classes, device, max_dets=300):
+    """Area-under-PR fallback when pycocotools is unavailable."""
     iou_ts = torch.linspace(0.5, 0.95, 10, device=device)
     gt_by_class = {c: {} for c in range(num_classes)}
     det_by_class = {c: [] for c in range(num_classes)}
@@ -150,6 +196,18 @@ def compute_map(gt_by_img, det_list, num_classes, device, max_dets=300):
     mAP = sum(sum(r) for r in ap_per_class) / (len(ap_per_class) * 10)
     ap50 = sum(r[0] for r in ap_per_class) / len(ap_per_class)
     return {"mAP": mAP, "AP50": ap50}
+
+
+def compute_map(gt_by_img, det_list, num_classes, device, max_dets=300):
+    """COCO-style mAP@[.5:.95] and AP50.
+
+    Uses the standard pycocotools COCO evaluator when available; falls back
+    to the area-under-PR approximation otherwise.
+    """
+    try:
+        return _compute_map_coco(gt_by_img, det_list, num_classes, device, max_dets)
+    except Exception:
+        return _compute_map_pr_area(gt_by_img, det_list, num_classes, device, max_dets)
 
 
 # ---------------------------------------------------------------------------

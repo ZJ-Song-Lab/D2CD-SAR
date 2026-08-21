@@ -102,29 +102,17 @@ def collate_batch(images, device):
 # ---------------------------------------------------------------------------
 # mAP evaluation (COCO-style, IoU 0.50:0.95)
 # ---------------------------------------------------------------------------
-def _iou_xyxy(b1, b2):
-    a1 = (b1[:, 2] - b1[:, 0]).clamp(min=0) * (b1[:, 3] - b1[:, 1]).clamp(min=0)
-    a2 = (b2[:, 2] - b2[:, 0]).clamp(min=0) * (b2[:, 3] - b2[:, 1]).clamp(min=0)
-    lt = torch.max(b1[:, None, :2], b2[None, :, :2])
-    rb = torch.min(b1[:, None, 2:], b2[None, :, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[..., 0] * wh[..., 1]
-    return inter / (a1[:, None] + a2[None, :] - inter + 1e-6)
-
-
-@torch.no_grad()
 def evaluate(distiller, data_loader, device, num_classes, img_size, max_dets=300):
-    """COCO-style mAP@[.5:.95] and AP50 (area-under-PR approximation)."""
-    from dinov3.sar_detection.rtdetr import PostProcess, box_cxcywh_to_xyxy
+    """COCO-style mAP@[.5:.95] and AP50 via the standard COCO evaluator."""
+    from dinov3.sar_detection.rtdetr import PostProcess
+    from dinov3.sar_detection.evaluate import compute_map
 
     core = unwrap(distiller)
     core.eval()
     post = PostProcess()
-    iou_ts = torch.linspace(0.5, 0.95, 10, device=device)
 
-    gt_by_class = {c: {} for c in range(num_classes)}      # c -> {img_id: cxcywh pixel}
-    det_by_class = {c: [] for c in range(num_classes)}    # c -> [(img_id, score, xyxy)]
-    gt_count = {c: 0 for c in range(num_classes)}
+    gt_by_img = {}
+    det_list = []
 
     for images, targets in data_loader:
         images = collate_batch(images, device)
@@ -136,67 +124,16 @@ def evaluate(distiller, data_loader, device, num_classes, img_size, max_dets=300
 
         for b in range(bsz):
             iid = int(t_dev[b]["image_id"].item())
-            gboxes = t_dev[b]["boxes"]
-            glabels = t_dev[b]["labels"]
-            for c in range(num_classes):
-                sel = (glabels == c).nonzero(as_tuple=True)[0]
-                gt_by_class[c].setdefault(iid, torch.empty((0, 4), device=device))
-                if sel.numel():
-                    gt_by_class[c][iid] = torch.cat([gt_by_class[c][iid], gboxes[sel]], 0)
-                gt_count[c] += sel.numel()
+            gt_by_img[iid] = {
+                "boxes": t_dev[b]["boxes"],
+                "labels": t_dev[b]["labels"],
+            }
             r = results[b]
-            scores, labels, boxes = r["scores"], r["labels"], r["boxes"]  # xyxy pixel
-            for c in range(num_classes):
-                sel = (labels == c).nonzero(as_tuple=True)[0]
-                for k in sel.tolist():
-                    det_by_class[c].append((iid, float(scores[k]), boxes[k].clone()))
+            scores, labels, boxes = r["scores"], r["labels"], r["boxes"]
+            for k in range(len(scores)):
+                det_list.append((iid, float(scores[k]), boxes[k].clone(), int(labels[k])))
 
-    ap_per_class = []  # [ap_iou0, ..., ap_iou9] per class
-    for c in range(num_classes):
-        n_gt = gt_count[c]
-        if n_gt == 0:
-            continue
-        dets = sorted(det_by_class[c], key=lambda x: -x[1])
-        gt_xy = {iid: box_cxcywh_to_xyxy(b.to(device)) for iid, b in gt_by_class[c].items()}
-        aps_iou = []
-        for t in iou_ts:
-            used = {iid: torch.zeros(b.shape[0], dtype=torch.bool, device=device)
-                    for iid, b in gt_xy.items()}
-            tp = torch.zeros(len(dets), device=device)
-            fp = torch.zeros(len(dets), device=device)
-            for i, (iid, _score, box) in enumerate(dets):
-                gts = gt_xy.get(iid)
-                if gts is None or gts.shape[0] == 0:
-                    fp[i] = 1
-                    continue
-                iou = _iou_xyxy(box.unsqueeze(0).to(device), gts)[0]
-                best_iou, best_j = torch.max(iou, 0)
-                if best_iou >= t and not used[iid][best_j]:
-                    used[iid][best_j] = True
-                    tp[i] = 1
-                else:
-                    fp[i] = 1
-            tp_cum = torch.cumsum(tp, 0)
-            fp_cum = torch.cumsum(fp, 0)
-            rc = torch.cat([torch.zeros(1, device=device), tp_cum / (n_gt + 1e-6),
-                            torch.ones(1, device=device)])
-            pr = torch.cat([torch.zeros(1, device=device),
-                           tp_cum / (tp_cum + fp_cum + 1e-6),
-                           torch.zeros(1, device=device)])
-            for i in range(len(pr) - 1, 0, -1):
-                pr[i - 1] = torch.max(pr[i - 1], pr[i])
-            idx = torch.nonzero(rc[1:] != rc[:-1], as_tuple=True)[0]
-            ap_t = torch.sum((rc[1:][idx] - rc[:-1][idx]) * pr[1:][idx]) if idx.numel() else \
-                torch.zeros((), device=device)
-            aps_iou.append(float(ap_t))
-        ap_per_class.append(aps_iou)
-
-    if not ap_per_class:
-        return {"mAP": 0.0, "AP50": 0.0}
-
-    mAP = sum(sum(r) for r in ap_per_class) / (len(ap_per_class) * 10)
-    ap50 = sum(r[0] for r in ap_per_class) / len(ap_per_class)
-    return {"mAP": mAP, "AP50": ap50}
+    return compute_map(gt_by_img, det_list, num_classes, device, max_dets=max_dets)
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +155,7 @@ def train_one_epoch(distiller, data_loader, optimizer, device, epoch, rank,
 
         # Step 3 of Algorithm 1: refresh the direction-aware variance gate on
         # the AIFI LoRA space (retain_graph=True keeps the graph for backward).
-        core.update_gate(out["loss_drcp"], out["loss_task"])
+        core.update_gate(out["loss_drcp"], out["loss_task"], out["z_distill"], out["z_task"])
 
         # Step 4: optimize.
         optimizer.zero_grad()

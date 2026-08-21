@@ -8,8 +8,8 @@
 Wires together the three components of the SAR-RTDETR paper:
   * a frozen DINOv3-ViT-Base semantic teacher (provides dense patch-level
     features F_tea^sp),
-  * a lightweight RT-DETR-R18 student whose AIFI FFN linears are replaced by
-    A^2TD-LoRA (parameter-level decoupling),
+  * a lightweight RT-DETR-R18 student whose AIFI attention output
+    projection is replaced by A^2TD-LoRA (parameter-level decoupling),
   * the DRCP module (feature-level alignment, produces L_DRCP).
 
 The forward pass implements the overall objective (Eq. 14):
@@ -19,7 +19,7 @@ The forward pass implements the overall objective (Eq. 14):
             + lambda_sparsity * L_sparsity
 
 `update_gate` measures the directional consensus between L_DRCP and L_task on
-the shared AIFI LoRA parameter space and refreshes the built-in variance gate
+the shared AIFI input activation z and refreshes the built-in variance gate
 (Eq. 8-11). The gate value takes effect on the *next* forward pass, matching
 the EMA-gating interpretation of Algorithm 1.
 
@@ -40,7 +40,7 @@ from dinov3.sar_detection.atd_lora import (
     total_sparsity_loss,
 )
 from dinov3.sar_detection.drcp import DRCP
-from dinov3.sar_detection.rtdetr import build_student
+from dinov3.sar_detection.rtdetr import build_student, box_cxcywh_to_xyxy
 
 # Must match dinov3/data/SSDD/transforms.Normalize so we can recover the raw
 # SAR intensity magnitude |I_SAR| from the normalized input tensor.
@@ -55,7 +55,7 @@ class SARRTDETRDistiller(nn.Module):
         self,
         num_classes: int = 1,
         num_queries: int = 300,
-        r_lora: int = 16,
+        r_lora: int = 100,
         lambda_distill: float = 1.0,
         lambda_ortho: float = 0.1,
         lambda_sparsity: float = 0.01,
@@ -91,22 +91,14 @@ class SARRTDETRDistiller(nn.Module):
         self.embed_dim = self.teacher.embed_dim
 
         self.teacher_blocks = [2, 5, 8, 11]
-        self.teacher_projectors = nn.ModuleList([
-            nn.Conv2d(self.embed_dim, self.embed_dim, kernel_size=1, bias=True)
-            for _ in self.teacher_blocks
-        ])
-        for proj in self.teacher_projectors:
-            with torch.no_grad():
-                proj.weight.copy_(
-                    torch.eye(self.embed_dim).unsqueeze(-1).unsqueeze(-1) * 0.25
-                )
-                nn.init.zeros_(proj.bias)
+        # Paper: "The teacher is frozen and has no trainable projector."
+        # Teacher features are used directly at C_t=768.
 
         # --- DRCP (feature-level alignment) ---
         drcp_kwargs = dict(drcp_kwargs or {})
         self.drcp = DRCP(
             C_t=self.embed_dim,
-            student_dims=self.student.backbone.dims,
+            student_dims=(self.student.backbone.dims[0], self.student.backbone.dims[1], self.student.d_model),
             **drcp_kwargs,
         )
 
@@ -120,23 +112,22 @@ class SARRTDETRDistiller(nn.Module):
             p.requires_grad_(False)
         return teacher
 
-    def _teacher_features(self, images: torch.Tensor) -> torch.Tensor:
-        """Dense patch-level teacher features F_tea^sp [B, C_t, Ht, Wt].
+    def _teacher_features(self, images: torch.Tensor) -> list:
+        """Three teacher block levels [T3, T4, T5_avg] for DRCP routing.
 
         Patch tokens are extracted from DINOv3-ViT-B transformer blocks
         {3,6,9,12} (1-indexed; ``self.teacher_blocks`` stores the 0-based
-        indices) and mapped by the learned 1x1 ``teacher_projectors`` to the
-        common alignment interface. The projected blocks are summed to form the
-        candidate teacher target F_tea^sp (paper Sec. 3.1, "Teacher Feature
-        Extraction").
+        indices). The teacher is frozen with no trainable projector (paper
+        Sec. 3.1). T3=T^{(3)}, T4=T^{(6)}, T5_avg=(T^{(9)}+T^{(12)})/2.
         """
         with torch.no_grad():
             feats = self.teacher.get_intermediate_layers(
                 images, n=self.teacher_blocks, reshape=True, norm=True
             )
-        projected = [proj(f) for proj, f in zip(self.teacher_projectors, feats)]
-        f_tea = torch.stack(projected, dim=0).sum(dim=0)
-        return f_tea.float()
+        t3 = feats[0].float()
+        t4 = feats[1].float()
+        t5 = 0.5 * (feats[2].float() + feats[3].float())
+        return [t3, t4, t5]
 
     # ----------------------------------------------------------- box utilities
     @staticmethod
@@ -155,24 +146,24 @@ class SARRTDETRDistiller(nn.Module):
             out.append(t)
         return out
 
-    def _normalize_obb_for_drcp(self, targets, H, W):
-        """Per-image list of normalized OBB corner tensors [N, 8] in [0, 1].
+    def _normalize_hbb_for_drcp(self, targets, H, W):
+        """Per-image list of normalized HBB tensors [N, 4] (xyxy, [0, 1]).
 
-        OBB corners (pixel, as returned by the dataset loaders) are scaled to
-        [0, 1] so DRCP can map them to the teacher resolution for the
-        anisotropic W_soft (Eq. 9-11).  ``None`` is returned for images with
-        no oriented annotation, in which case DRCP falls back to the uniform
-        background mask.
+        Horizontal bounding boxes (cxcywh pixel from the dataset loaders) are
+        converted to xyxy and scaled to [0, 1] for the DRCP spatial loss
+        weight W_soft (Eq. soft_mask). ``None`` is returned for images with no
+        annotation, in which case DRCP uses uniform feature matching.
         """
         out = []
         for t in targets:
-            obb = t.get("obb")
-            if obb is not None and len(obb) > 0:
+            boxes = t.get("boxes")
+            if boxes is not None and len(boxes) > 0:
+                xyxy = box_cxcywh_to_xyxy(boxes)
                 scale = torch.tensor(
-                    [W, H, W, H, W, H, W, H],
-                    device=obb.device, dtype=obb.dtype,
+                    [W, H, W, H],
+                    device=xyxy.device, dtype=xyxy.dtype,
                 )
-                out.append((obb / scale).detach())
+                out.append((xyxy / scale).detach())
             else:
                 out.append(None)
         return out
@@ -194,7 +185,7 @@ class SARRTDETRDistiller(nn.Module):
     def forward(self, images: torch.Tensor, targets: list):
         """Args:
             images:  [B, 3, H, W] batched and normalized SAR images.
-            targets: list of dicts {boxes (cxcywh, pixel), labels, obb}.
+            targets: list of dicts {boxes (cxcywh, pixel), labels}.
         Returns: dict of losses + the purified teacher feature.
 
         The forward is split into two passes through the AIFI so that the
@@ -206,7 +197,7 @@ class SARRTDETRDistiller(nn.Module):
         B, _, H, W = images.shape
 
         # 1. Frozen teacher patch features.
-        f_tea = self._teacher_features(images)  # [B, C_t, Ht, Wt]
+        teacher_features = self._teacher_features(images)  # [T3, T4, T5_avg]
 
         # 2. Backbone features (frozen — computed once, reused for both passes).
         with torch.no_grad():
@@ -231,11 +222,11 @@ class SARRTDETRDistiller(nn.Module):
             images, detach_det=True, backbone_features=(s3, s4, s5)
         )
         sar_gray = self._sar_intensity(images)
-        obb_norm = self._normalize_obb_for_drcp(targets, H, W)
+        hbb_norm = self._normalize_hbb_for_drcp(targets, H, W)
         f_tea_hat, loss_drcp = self.drcp(
-            [outputs_distill["s3"], outputs_distill["s4"], outputs_distill["s5"]],
-            f_tea,
-            obb_norm,
+            [outputs_distill["s3"], outputs_distill["s4"], outputs_distill["f5"]],
+            teacher_features,
+            hbb_norm,
             sar_gray,
         )
 
@@ -262,32 +253,40 @@ class SARRTDETRDistiller(nn.Module):
             "loss_sparsity": loss_sparsity.detach(),
             "gate_value": self.gate.value(),
             "f_tea_hat": f_tea_hat.detach(),
+            "z_distill": outputs_distill["z"],
+            "z_task": outputs_task["z"],
         }
 
     # --------------------------------------------------- variance gate update
-    def update_gate(self, loss_drcp: torch.Tensor, loss_task: torch.Tensor) -> float:
-        """Refresh the direction-aware variance gate on the AIFI LoRA space.
+    def update_gate(self, loss_drcp: torch.Tensor, loss_task: torch.Tensor,
+                    z_distill: torch.Tensor, z_task: torch.Tensor) -> float:
+        """Refresh the direction-aware variance gate on the shared AIFI input z.
 
-        Implements Eq. (8)-(11): directional consistency ``c``, direction-aware
-        ratio ``r``, adaptive momentum ``alpha`` and EMA ``w``. The gradient is
-        computed with ``retain_graph=True`` so the graph is still available for
-        the subsequent ``loss_total.backward()``.
+        Implements Eq. (8)-(11): activation-cosine direction agreement ``c_dir``,
+        direction-aware ratio ``r``, adaptive momentum ``alpha`` and EMA ``w``.
+        Probes are gradients of L_task and L_DRCP w.r.t. the common AIFI input
+        activation z (Eq. activation_probes), computed with ``retain_graph=True``
+        so the graph is still available for ``loss_total.backward()``.
         """
-        lora_params = collect_atd_params(self.student.atd_modules())
-        if not lora_params:
-            return self.gate.value()
-        g_drcp = flattened_grad(loss_drcp, lora_params, retain_graph=True)
-        g_task = flattened_grad(loss_task, lora_params, retain_graph=True)
-        # Keep the gating signal consistent across data-parallel ranks by
-        # averaging the flattened gradients before measuring their norms.
+        p_distill = torch.autograd.grad(
+            loss_drcp, z_distill, retain_graph=True, allow_unused=True)[0]
+        p_task = torch.autograd.grad(
+            loss_task, z_task, retain_graph=True, allow_unused=True)[0]
+        if p_distill is None:
+            p_distill = torch.zeros_like(z_distill)
+        if p_task is None:
+            p_task = torch.zeros_like(z_task)
+        p_distill = p_distill.detach().flatten()
+        p_task = p_task.detach().flatten()
+        # Keep the gating signal consistent across data-parallel ranks.
         if dist.is_available() and dist.is_initialized():
             world_size = dist.get_world_size()
             if world_size > 1:
-                dist.all_reduce(g_drcp, op=dist.ReduceOp.SUM)
-                dist.all_reduce(g_task, op=dist.ReduceOp.SUM)
-                g_drcp = g_drcp / world_size
-                g_task = g_task / world_size
-        return self.gate.update(g_drcp, g_task)
+                dist.all_reduce(p_distill, op=dist.ReduceOp.SUM)
+                dist.all_reduce(p_task, op=dist.ReduceOp.SUM)
+                p_distill = p_distill / world_size
+                p_task = p_task / world_size
+        return self.gate.update(p_distill, p_task)
 
     # --------------------------------------------------------- deployment
     @torch.no_grad()

@@ -8,20 +8,23 @@ r"""DRCP: Depth-Routed Cross-Modal Purifier.
 Implements the feature-level alignment module of the SAR-RTDETR paper.
 
 Phase 1 - Depth-wise Semantic Routing (Eq. 3-5):
-  S_i interpolated to the teacher spatial resolution and projected to C_t;
-  routing weights alpha_i = softmax_i(w_d^T RMSNorm(GAP(S_i)));
-  F_stu_routed = sum_i alpha_i S_i.
+  Student levels U = {S3, S4, F5} interpolated to the teacher spatial
+  resolution and projected to C_t; routing weights alpha_i =
+  softmax_i(w_d^T RMSNorm(GAP(U_i))); F_stu_routed = sum_i alpha_i U_i.
+  The same alpha_i (with stop-gradient) route the teacher blocks:
+  F_tea_sp = sum_i sg(alpha_i) T_i, where T_3=T^{(3)}, T_4=T^{(6)},
+  T_5 = (T^{(9)}+T^{(12)})/2.
 
-Phase 2 - Joint Spatio-Channel Purification (Eq. 6-12):
-  g         = MLP(low_pass_FFT(F_tea))           # frequency-guided channel gate
-  E(x,y)    = mean_{N_K} |I_SAR|^2               # local scattering energy
-  W_soft    = inside-OBB normalized energy | mu * exp(-d^2 / 2 sigma^2)
-  M_joint   = g \otimes W_soft
-  F_tea_hat = M_joint \odot F_tea
+Phase 2 - Channel and Spatial Weighting (Eq. 6-12):
+  Channel gate: GAP -> 1D rFFT -> magnitude[:k_cut] -> MLP -> sigmoid -> g
+  Local intensity: E(x,y) = mean_{K_I x K_I} |I|^2  (empirical heuristic)
+  W_soft: token-center-in-box rule on horizontal bounding boxes, with
+  normalized energy inside and Gaussian decay outside.
+  Purified teacher: F_tea_hat = g * F_tea_sp  (W_soft is loss weight only)
 
-L_DRCP (Eq. 13): spatially weighted cosine distance between the teacher and
-the routed student feature, with W_soft re-applied as the region weight to
-avoid zero-vector numerical instability.
+L_DRCP (Eq. 13): spatially weighted cosine distance between the purified
+teacher and the routed student feature, with W_soft as the explicit spatial
+loss weight (not multiplied into the teacher feature before cosine).
 """
 
 import math
@@ -39,30 +42,32 @@ class DRCP(nn.Module):
     Args:
         C_t: teacher channel dimension (DINOv3-ViT-B -> 768).
         student_dims: channel dims of the routed student levels
-            (e.g. (C3, C4, C5) = (128, 256, 512) for RT-DETR-R18). The routed
-            levels are the backbone features {S3, S4, S5}; F5 (AIFI output) is
-            used by the detection branch, not by DRCP.
-        K_window: scattering-energy averaging window (pixels).
-        mu: background soft-mask magnitude outside OBBs.
-        sigma: background soft-mask Gaussian bandwidth.
-        lowpass_ratio: fraction of channel frequencies kept by the low-pass.
+            (e.g. (C3, C4, C5=F5) = (128, 256, 256) for RT-DETR-R18). The
+            routed levels are {S3, S4, F5}, where F5 is the AIFI-refined
+            deepest representation; routing F5 (not raw S5) is what makes the
+            L_DRCP feature-consistency gradient flow through the AIFI's
+            distillation LoRA branch (paper Sec. 3.2, routed interface R).
+        K_window: local-intensity averaging window K_I (pixels).
+        mu: background soft-mask magnitude outside boxes.
+        sigma: background soft-mask Gaussian bandwidth (token cells).
+        k_cut: number of low-index rFFT magnitude coefficients retained.
     """
 
     def __init__(
         self,
         C_t: int = 768,
-        student_dims=(128, 256, 512),
-        K_window: int = 3,
-        mu: float = 0.3,
-        sigma: float = 2.0,
-        lowpass_ratio: float = 0.125,
+        student_dims=(128, 256, 256),
+        K_window: int = 5,
+        mu: float = 0.5,
+        sigma: float = 4.0,
+        k_cut: int = 192,
     ):
         super().__init__()
         self.C_t = C_t
         self.K_window = K_window
         self.mu = mu
         self.sigma = sigma
-        self.lowpass_L = max(2, int(C_t * lowpass_ratio))
+        self.k_cut = min(k_cut, C_t // 2 + 1)  # clamp to available rFFT bins
 
         # Student-level projections to the teacher channel dim.
         self.proj = nn.ModuleList(
@@ -72,10 +77,10 @@ class DRCP(nn.Module):
         self.w_d = nn.Parameter(torch.randn(C_t) * 0.02)
         self.key_norm = RMSNorm(C_t)
 
-        # Frequency-guided channel gate (bottleneck MLP).
-        hidden = max(C_t // 4, 8)
+        # Frequency-guided channel gate: k_cut -> 512 -> C_t.
+        hidden = 512
         self.channel_gate = nn.Sequential(
-            nn.Linear(C_t, hidden),
+            nn.Linear(self.k_cut, hidden),
             nn.GELU(),
             nn.Linear(hidden, C_t),
             nn.Sigmoid(),
@@ -84,7 +89,8 @@ class DRCP(nn.Module):
     # ------------------------------------------------------------------
     # Phase 1: depth-wise semantic routing
     # ------------------------------------------------------------------
-    def _route(self, student_features: list, Ht: int, Wt: int) -> torch.Tensor:
+    def _route(self, student_features: list, Ht: int, Wt: int):
+        """Route student features and return (routed, alphas)."""
         routed_levels = []
         keys = []
         for feat, proj in zip(student_features, self.proj):
@@ -97,38 +103,47 @@ class DRCP(nn.Module):
         logits = torch.stack([torch.einsum("b c, c -> b", k, self.w_d) for k in keys], dim=1)  # [B, L]
         alphas = torch.softmax(logits, dim=1)  # [B, L]
         routed = sum(a[..., None, None, None] * s for a, s in zip(alphas.unbind(1), routed_levels))
+        return routed, alphas
+
+    @staticmethod
+    def _route_teacher(teacher_features: list, alphas: torch.Tensor) -> torch.Tensor:
+        """Route teacher blocks with stop-gradient on routing weights.
+
+        F_tea_sp = sum_i sg(alpha_i) * T_i, where sg stops gradient through
+        the routing weights so the routing query learns only from the
+        student-side alignment gradient.
+        """
+        sg_alphas = alphas.detach()
+        routed = sum(a[..., None, None, None] * t for a, t in zip(sg_alphas.unbind(1), teacher_features))
         return routed  # [B, C_t, Ht, Wt]
 
     # ------------------------------------------------------------------
-    # Phase 2: joint spatio-channel purification
+    # Phase 2: channel and spatial weighting
     # ------------------------------------------------------------------
     def _channel_gate(self, f_tea: torch.Tensor) -> torch.Tensor:
-        # 1D FFT along the channel dim, low-pass, inverse FFT, GAP -> MLP.
-        freq = torch.fft.rfft(f_tea, dim=1)
-        freq[..., self.lowpass_L:, :, :] = 0
-        recon = torch.fft.irfft(freq, n=self.C_t, dim=1)  # [B, C_t, Ht, Wt]
-        desc = recon.flatten(2).mean(dim=2)  # [B, C_t]
-        g = self.channel_gate(desc).unsqueeze(-1).unsqueeze(-1)  # [B, C_t, 1, 1]
-        return g
+        # GAP -> 1D rFFT along channel -> magnitude of first k_cut -> MLP -> sigmoid.
+        desc = f_tea.flatten(2).mean(dim=2)  # [B, C_t]
+        zeta = torch.fft.rfft(desc, dim=1)  # [B, C_t//2+1] complex
+        a = zeta[:, : self.k_cut].abs()  # [B, k_cut]
+        g = self.channel_gate(a)  # [B, C_t]
+        return g.unsqueeze(-1).unsqueeze(-1)  # [B, C_t, 1, 1]
 
-    def _scattering_energy(self, sar_gray: torch.Tensor, Ht: int, Wt: int) -> torch.Tensor:
-        # sar_gray: [B, 1, H, W] (magnitude of the SAR intensity).
+    def _local_intensity(self, sar_gray: torch.Tensor, Ht: int, Wt: int) -> torch.Tensor:
+        # E(x,y) = mean_{K_I x K_I} |I|^2, then area-average to token grid.
         e = sar_gray.pow(2)
-        e = F.interpolate(e, size=(Ht, Wt), mode="bilinear", align_corners=False)
         k = self.K_window
         pad = k // 2
         e = F.avg_pool2d(F.pad(e, [pad, pad, pad, pad], mode="replicate"), k, stride=1)
+        e = F.adaptive_avg_pool2d(e, (Ht, Wt))  # patch-cell area average
         return e  # [B, 1, Ht, Wt]
 
-    def _soft_mask(self, energy: torch.Tensor, obb_norm: list, Ht: int, Wt: int) -> torch.Tensor:
-        """Build W_soft per image from oriented bounding boxes (Eq. 9-11).
+    def _soft_mask(self, energy: torch.Tensor, hbb_norm: list, Ht: int, Wt: int) -> torch.Tensor:
+        """Build W_soft per image from horizontal bounding boxes (Eq. soft_mask).
 
-        ``obb_norm`` is a per-image list of OBB corner tensors [N, 8] in
-        normalized [0, 1] coordinates (4 corner xy-pairs).  The point-to-OBB
-        distance is computed in each OBB's local frame, so the Gaussian decay
-        is *anisotropic* and aligned with the ship orientation, as required
-        by Eq. (9).  When OBBs are unavailable the routine falls back to the
-        axis-aligned rectangle derived from the same corners.
+        ``hbb_norm`` is a per-image list of HBB tensors [N, 4] in normalized
+        [0, 1] xyxy coordinates.  The token-center-in-box rule assigns each
+        token to the largest containing box; inside-box tokens use normalized
+        energy, outside-box tokens use Gaussian decay.
         """
         device = energy.device
         yy, xx = torch.meshgrid(
@@ -136,50 +151,69 @@ class DRCP(nn.Module):
             torch.arange(Wt, device=device, dtype=energy.dtype),
             indexing="ij",
         )
-        pts = torch.stack([xx, yy], dim=-1)  # [Ht, Wt, 2]  (x, y)
+        # Token centers in token-cell units.
+        cx = xx.float() + 0.5  # [Ht, Wt]
+        cy = yy.float() + 0.5  # [Ht, Wt]
+
         out = torch.empty((energy.shape[0], 1, Ht, Wt), device=device, dtype=energy.dtype)
+
         for b in range(energy.shape[0]):
             e = energy[b, 0]  # [Ht, Wt]
-            corners = obb_norm[b]
-            if corners is None or len(corners) == 0:
-                out[b, 0] = self.mu
+            boxes = hbb_norm[b]
+            if boxes is None or len(boxes) == 0:
+                out[b, 0] = 1.0  # Empty GT: uniform weight
                 continue
-            inside_val = torch.full((Ht, Wt), -1.0, device=device, dtype=energy.dtype)
+
+            # Convert normalized [0,1] boxes to token-cell coordinates.
+            boxes_tc = boxes.detach().clone()
+            boxes_tc[:, 0] *= Wt  # x1
+            boxes_tc[:, 1] *= Ht  # y1
+            boxes_tc[:, 2] *= Wt  # x2
+            boxes_tc[:, 3] *= Ht  # y2
+
+            N = boxes_tc.shape[0]
+            assigned = torch.full((Ht, Wt), -1, device=device, dtype=torch.long)
+            best_area = torch.full((Ht, Wt), -1.0, device=device, dtype=energy.dtype)
             min_d2 = torch.full((Ht, Wt), float("inf"), device=device, dtype=energy.dtype)
-            for obb in corners:
-                c = obb.reshape(4, 2)  # [4, 2] normalized (x, y)
-                cx = c[:, 0] * Wt
-                cy = c[:, 1] * Ht
-                c_pix = torch.stack([cx, cy], dim=1)  # [4, 2]
-                center = c_pix.mean(dim=0)  # [2]
-                e1 = c_pix[1] - c_pix[0]
-                e2 = c_pix[3] - c_pix[0]
-                l1 = e1.norm()
-                l2 = e2.norm()
-                if l1 < 1e-6 or l2 < 1e-6:
-                    continue
-                u1 = e1 / l1
-                u2 = e2 / l2
-                h1 = l1 / 2.0
-                h2 = l2 / 2.0
-                d = pts - center  # [Ht, Wt, 2]
-                local_x = (d * u1).sum(dim=-1)  # [Ht, Wt]
-                local_y = (d * u2).sum(dim=-1)  # [Ht, Wt]
-                dist_x = torch.clamp(local_x.abs() - h1, min=0.0)
-                dist_y = torch.clamp(local_y.abs() - h2, min=0.0)
-                d2 = dist_x * dist_x + dist_y * dist_y
+
+            for k in range(N):
+                x1, y1, x2, y2 = boxes_tc[k].tolist()
+                inside = (cx >= x1) & (cx <= x2) & (cy >= y1) & (cy <= y2)
+                box_area = (x2 - x1) * (y2 - y1)
+
+                # Euclidean distance to box boundary (0 inside).
+                dx = torch.clamp(torch.min(cx - x2, x1 - cx), min=0.0)
+                dy = torch.clamp(torch.min(cy - y2, y1 - cy), min=0.0)
+                d2 = dx * dx + dy * dy
                 min_d2 = torch.minimum(min_d2, d2)
-                inside = (local_x.abs() <= h1) & (local_y.abs() <= h2)
-                if inside.any():
-                    e_in = e[inside]
-                    e_min = e_in.min()
-                    e_max = e_in.max()
-                    norm_e = (e - e_min) / (e_max - e_min + 1e-6)
-                    inside_val = torch.maximum(inside_val, torch.where(inside, norm_e, torch.full_like(norm_e, -1.0)))
-            outside_val = self.mu * torch.exp(-min_d2 / (2.0 * self.sigma ** 2))
-            mask = torch.where(inside_val >= 0, inside_val, outside_val)
-            out[b, 0] = mask
-        return out.clamp(min=0.0)
+
+                # Assign to largest box (smallest k breaks ties via >).
+                mask = inside & (box_area > best_area)
+                assigned = torch.where(mask, torch.full_like(assigned, k), assigned)
+                best_area = torch.where(mask, torch.full_like(best_area, box_area), best_area)
+
+            # Compute per-box energy extrema and assign W_soft.
+            w = torch.full((Ht, Wt), 0.0, device=device, dtype=energy.dtype)
+            for k in range(N):
+                mask_k = assigned == k
+                if not mask_k.any():
+                    continue
+                e_vals = e[mask_k]
+                e_min_k = e_vals.min()
+                e_max_k = e_vals.max()
+                if (e_max_k - e_min_k).abs() < 1e-6:
+                    w[mask_k] = 0.5
+                else:
+                    w[mask_k] = (e[mask_k] - e_min_k) / (e_max_k - e_min_k + 1e-6)
+
+            # Outside-box tokens: Gaussian decay.
+            outside = assigned < 0
+            if outside.any():
+                w[outside] = self.mu * torch.exp(-min_d2[outside] / (2.0 * self.sigma ** 2))
+
+            out[b, 0] = w.clamp(0.0, 1.0)
+
+        return out
 
     # ------------------------------------------------------------------
     # Forward + loss
@@ -187,35 +221,43 @@ class DRCP(nn.Module):
     def forward(
         self,
         student_features: list,
-        f_tea: torch.Tensor,
-        obb_norm: list,
+        teacher_features: list,
+        hbb_norm: list,
         sar_gray: torch.Tensor,
     ):
         """Args:
-            student_features: list [S3, S4, S5] (backbone feature hierarchy).
-            f_tea: teacher patch features [B, C_t, Ht, Wt].
-            obb_norm: per-image list of OBB corner tensors [N, 8] (normalized
-                xy-pairs in [0, 1]) for the anisotropic W_soft (Eq. 9-11).
+            student_features: list [S3, S4, F5] where F5 is the AIFI-refined S5
+                produced by the student's AIFI encoder (paper routed interface
+                R = {S3, S4, F5}).
+            teacher_features: list [T3, T4, T5_avg] — projected teacher block
+                features, each [B, C_t, Ht, Wt]. T3=T^{(3)}, T4=T^{(6)},
+                T5_avg=(T^{(9)}+T^{(12)})/2.
+            hbb_norm: per-image list of HBB tensors [N, 4] (xyxy, normalized
+                [0,1]) for the spatial loss weight W_soft.
             sar_gray: SAR intensity magnitude [B, 1, H, W].
         Returns:
             f_tea_hat: purified teacher feature [B, C_t, Ht, Wt].
             loss: L_DRCP scalar.
         """
-        B, C_t, Ht, Wt = f_tea.shape
+        B, C_t, Ht, Wt = teacher_features[0].shape
 
-        f_stu_routed = self._route(student_features, Ht, Wt)  # [B, C_t, Ht, Wt]
+        # Phase 1: Route student features and compute routing weights.
+        f_stu_routed, alphas = self._route(student_features, Ht, Wt)
+
+        # Route teacher features with stop-gradient on alpha.
+        f_tea = self._route_teacher(teacher_features, alphas)
+
+        # Phase 2: Channel gate g (GAP -> rFFT -> magnitude -> MLP -> sigmoid).
         g = self._channel_gate(f_tea)  # [B, C_t, 1, 1]
-        energy = self._scattering_energy(sar_gray, Ht, Wt)  # [B, 1, Ht, Wt]
-        w_soft = self._soft_mask(energy, obb_norm, Ht, Wt)  # [B, 1, Ht, Wt]
+        f_tea_hat = g * f_tea  # purified teacher: only g, NOT w_soft
 
-        m_joint = g * w_soft  # [B, C_t, Ht, Wt]
-        f_tea_hat = m_joint * f_tea
+        # Spatial loss weight W_soft (horizontal bounding boxes + local intensity).
+        energy = self._local_intensity(sar_gray, Ht, Wt)  # [B, 1, Ht, Wt]
+        w_soft = self._soft_mask(energy, hbb_norm, Ht, Wt)  # [B, 1, Ht, Wt]
 
-        # Eq.13: spatially weighted cosine distance between the *purified*
-        # teacher feature and the routed student feature.  Using f_tea_hat
-        # (rather than raw f_tea) ensures the FFT channel gate g and the OBB
-        # soft mask W_soft both enter the distillation gradient.  Norms are
-        # clamped to avoid division-by-near-zero in masked regions.
+        # Eq.13: spatially weighted cosine distance.  W_soft is the explicit
+        # spatial loss weight; it is NOT multiplied into the teacher feature
+        # before cosine normalization (paper Sec. 3.2, Eq. drcp_loss).
         a = f_tea_hat.flatten(2)  # [B, C_t, HW]
         b = f_stu_routed.flatten(2)  # [B, C_t, HW]
         a_norm = a.norm(dim=1).clamp(min=1e-6)  # [B, HW]
