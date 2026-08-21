@@ -114,6 +114,29 @@ W_deploy = W0 + B_det·Σ_det·A_det + B_distill·(w*·Σ_distill)·A_distill
 
 The teacher, DRCP, activation probes, and gate update are removed. The merged detector preserves the registered RT-DETR student architecture and tensor interface. Actual latency, memory, and quantized accuracy are empirical properties measured on the target device rather than inferred from graph structure.
 
+## Qualitative Results
+
+<p align="center">
+  <img src="figures/qual_detection.jpg" alt="Qualitative Detection Comparison" width="100%"/>
+</p>
+<p align="center"><i>Qualitative detections in a cluttered inshore scene. The GT panel shows ground-truth boxes in green. Panels (a)–(d) show predictions from YOLOv13-S, RT-DETRv3-R18, D-FINE-S, and SARES-DEIM-S; the last panel shows SAR-RTDETR. Blue rectangles denote predicted boxes. Yellow ellipses mark missed ships; red ellipses mark over-detection errors.</i></p>
+
+The compact near-shore group is partially missed by YOLOv13-S, D-FINE-S, and SARES-DEIM-S, while RT-DETRv3-R18 assigns redundant boxes to strong scatterers. SAR-RTDETR suppresses the duplicated responses and retains the small near-shore targets, consistent with the DRCP spatial loss weight and the A²TD-LoRA gradient separation.
+
+## Feature-Response Visualization
+
+<p align="center">
+  <img src="figures/heatmap_inshore.png" alt="Inshore Feature Heatmap" width="100%"/>
+</p>
+<p align="center"><i>Feature-response visualization for an inshore scene. Columns: original SAR image, feature heatmap, and overlay. Rows (top to bottom): RT-DETR-R18, +DRCP, and +DRCP + A²TD-LoRA. Warmer colors indicate stronger responses; all rows use the same within-scene color scale.</i></p>
+
+<p align="center">
+  <img src="figures/heatmap_offshore.png" alt="Offshore Feature Heatmap" width="100%"/>
+</p>
+<p align="center"><i>Feature-response visualization for an offshore scene. Column and row organization follows the inshore figure. Warmer colors indicate stronger responses; all rows use the same registered visualization procedure and within-scene color scale.</i></p>
+
+In the inshore example, the RT-DETR-R18 response is distributed over ships, quay edges, and heterogeneous land clutter. Adding DRCP moves the strongest responses toward elongated ship structures and reduces diffuse activation over open water. With DRCP and A²TD-LoRA, the warm regions become narrower and follow the visible ship extents more closely. The offshore scene tests a different failure mode where the baseline response spreads across wave clutter; the full model concentrates the response on the target ships.
+
 ## Repository Structure
 
 ```
@@ -135,7 +158,10 @@ dinov3-main/
 ├── figures/
 │   ├── overall_architecture.jpg
 │   ├── drcp.jpg
-│   └── atd_lora.jpg
+│   ├── atd_lora.jpg
+│   ├── qual_detection.jpg
+│   ├── heatmap_inshore.png
+│   └── heatmap_offshore.png
 ├── conda.yaml
 └── README.md
 ```
