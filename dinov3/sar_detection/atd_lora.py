@@ -5,14 +5,14 @@
 
 """A^2TD-LoRA: Adaptive Task-Decoupled Orthogonal LoRA.
 
-Implements the parameter-level decoupling module of the SAR-RTDETR paper.
+Implements the parameter-level decoupling module of the D²CD-SAR paper.
 Two parallel low-rank branches (detection / distillation) are injected into
 the frozen AIFI attention output projection. An internal direction-aware
 variance gate self-modulates the distillation branch capacity. Orthogonal
 regularization and an L1 sparsity penalty keep the branches independent and
 compact.
 
-Reference equations (SAR-RTDETR.tex):
+Reference equations (D²CD-SAR.tex):
   Eq.(6)  forward:  v = [W0 + B_det Sigma_det A_det + B_distill (w*Sigma_distill) A_distill] u
   Eq.(7)  L_ortho = (<dW_det, dW_distill>_F / (||dW_det||_F ||dW_distill||_F + eps))^2
   Eq.(8)  rho = <p_task, p_distill> / (||p_task||_2 ||p_distill||_2 + eps);

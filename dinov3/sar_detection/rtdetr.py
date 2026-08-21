@@ -3,7 +3,7 @@
 # This software may be used and distributed in accordance with the
 # terms of the DINOv3 License Agreement.
 
-"""RT-DETR-R18 student detector for the SAR-RTDETR distillation framework.
+"""RT-DETR-R18 student detector for the D²CD-SAR distillation framework.
 
 Contains:
   * ResNet-18 backbone producing {S3, S4, S5} (strides 8 / 16 / 32).

@@ -1,4 +1,4 @@
-# DCD-SAR: Decoupled Cross-Modal Distillation for Deployment-Compatible SAR Ship Detection
+# D²CD-SAR: Depth-Routed and Decoupled Cross-Domain Distillation for SAR
 
 <p align="center">
   <img src="figures/overall_architecture.jpg" alt="Overall Architecture" width="100%"/>
@@ -9,7 +9,7 @@
 
 ## Overview
 
-**DCD-SAR** transfers dense features from a **frozen DINOv3 teacher** to an **RT-DETR-R18 student** via a unified decoupling strategy:
+**D²CD-SAR** transfers dense features from a **frozen DINOv3 teacher** to an **RT-DETR-R18 student** via a unified decoupling strategy:
 
 - **DRCP** (Depth-Routed Cross-Modal Purifier) — multi-level routing `{S3, S4, F5}` + channel/spatial weighting
 - **A²TD-LoRA** (Adaptive Task-Decoupled Orthogonal LoRA) — two low-rank branches on the AIFI attention output projection with activation-cosine direction gating
@@ -53,7 +53,7 @@
 <p align="center">
   <img src="figures/qual_detection.jpg" alt="Qualitative Detection Comparison" width="100%"/>
 </p>
-<p align="center"><i>Qualitative detections in a cluttered inshore scene. GT (green) vs. predictions (blue) from YOLOv13-S, RT-DETRv3-R18, D-FINE-S, SARES-DEIM-S, and DCD-SAR. Yellow ellipses: missed ships; red ellipses: over-detection errors.</i></p>
+<p align="center"><i>Qualitative detections in a cluttered inshore scene. GT (green) vs. predictions (blue) from YOLOv13-S, RT-DETRv3-R18, D-FINE-S, SARES-DEIM-S, and D²CD-SAR. Yellow ellipses: missed ships; red ellipses: over-detection errors.</i></p>
 
 ## Feature-Response Visualization
 
@@ -100,7 +100,7 @@
 ```bash
 python -m dinov3.sar_detection.train \
     --dataset ssdd --data-root ./dinov3/data/SSDD \
-    --output-dir ./outputs/sar_rtdetr \
+    --output-dir ./outputs/d2cd_sar \
     --img-size 640 --batch-size 16 --lr 1e-4 --weight-decay 1e-4 \
     --r-lora 100 --lambda-distill 1.0 --lambda-ortho 0.1 --lambda-sparsity 0.01 \
     --seed 42
@@ -110,9 +110,9 @@ python -m dinov3.sar_detection.train \
 
 ```bash
 python -m dinov3.sar_detection.evaluate \
-    --checkpoint outputs/sar_rtdetr/deploy_student.pth \
+    --checkpoint outputs/d2cd_sar/deploy_student.pth \
     --dataset ssdd --data-root ./dinov3/data/SSDD \
-    --split val --output-dir outputs/sar_rtdetr/eval
+    --split val --output-dir outputs/d2cd_sar/eval
 ```
 
 Uses standard pycocotools COCO evaluator (AP@.5:.95, AP50).
@@ -171,8 +171,8 @@ python -m dinov3.sar_detection.test_smoke
 ## Citation
 
 ```bibtex
-@article{dcd_sar,
-  title   = {DCD-SAR: Decoupled Cross-Modal Distillation for Deployment-Compatible SAR Ship Detection},
+@article{d2cd_sar,
+  title   = {D²CD-SAR: Depth-Routed and Decoupled Cross-Domain Distillation for SAR},
   author  = {Anonymous Author(s)},
   year    = {2026},
   note    = {Under review}

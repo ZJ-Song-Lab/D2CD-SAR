@@ -4,9 +4,9 @@
 # terms of the DINOv3 License Agreement.
 
 """
-Training script for SAR-RTDETR cross-modal knowledge distillation.
+Training script for D²CD-SAR cross-modal knowledge distillation.
 
-Implements Algorithm 1 of the SAR-RTDETR paper:
+Implements Algorithm 1 of the D²CD-SAR paper:
   1. student multi-scale features {S3, S4, S5} + AIFI -> F5;
   2. frozen DINOv3-ViT-Base teacher patch features F_tea^sp;
   3. DRCP alignment -> L_DRCP, detection losses -> L_task, and the
@@ -198,7 +198,7 @@ def main(args):
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
     if rank == 0:
-        print("=== SAR-RTDETR cross-modal distillation ===")
+        print("=== D²CD-SAR cross-modal distillation ===")
         print(f"Dataset: {args.dataset}, Data root: {args.data_root}")
         print(f"World size: {world_size}, Rank: {rank}, Device: {device}")
         print(f"Seed: {args.seed}")
@@ -298,13 +298,13 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("SAR-RTDETR distillation training")
+    parser = argparse.ArgumentParser("D²CD-SAR distillation training")
     # Data
     parser.add_argument("--dataset", default="ssdd", choices=["ssdd", "hrsid"], type=str,
                         help="Dataset to train on")
     parser.add_argument("--data-root", default=None, type=str,
                         help="Root dir of dataset (default: ./dinov3/data/<DATASET>)")
-    parser.add_argument("--output-dir", default="./outputs/sar_rtdetr", type=str)
+    parser.add_argument("--output-dir", default="./outputs/d2cd_sar", type=str)
     parser.add_argument("--img-size", default=896, type=int)
     # Model (paper Implementation Details)
     parser.add_argument("--num-classes", default=1, type=int)

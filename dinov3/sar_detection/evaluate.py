@@ -3,7 +3,7 @@
 # This software may be used and distributed in accordance with the
 # terms of the DINOv3 License Agreement.
 
-"""Standalone evaluation script for the SAR-RTDETR deployment model.
+"""Standalone evaluation script for the D²CD-SAR deployment model.
 
 Produces the reproducibility artifacts referenced in the paper's Experiment
 section:
@@ -22,16 +22,16 @@ Usage
 Single checkpoint::
 
     python -m dinov3.sar_detection.evaluate \
-        --checkpoint outputs/sar_rtdetr/deploy_student.pth \
+        --checkpoint outputs/d2cd_sar/deploy_student.pth \
         --dataset ssdd --data-root ./dinov3/data/SSDD \
-        --split val --output-dir outputs/sar_rtdetr/eval
+        --split val --output-dir outputs/d2cd_sar/eval
 
 Multiple seeds (aggregates mean ± std)::
 
     python -m dinov3.sar_detection.evaluate \
-        --checkpoint outputs/sar_rtdetr/deploy_student.pth \
+        --checkpoint outputs/d2cd_sar/deploy_student.pth \
         --dataset ssdd --data-root ./dinov3/data/SSDD \
-        --split val --seeds 42,123,2024 --output-dir outputs/sar_rtdetr/eval
+        --split val --seeds 42,123,2024 --output-dir outputs/d2cd_sar/eval
 """
 
 import argparse
@@ -357,7 +357,7 @@ def aggregate_seeds(per_seed_metrics, output_dir):
 # ---------------------------------------------------------------------------
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"=== SAR-RTDETR evaluation ===")
+    print(f"=== D²CD-SAR evaluation ===")
     print(f"Device: {device}, Dataset: {args.dataset}, Split: {args.split}")
 
     norm_mean, norm_std = DATASET_STATS[args.dataset]
@@ -419,13 +419,13 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("SAR-RTDETR evaluation")
+    parser = argparse.ArgumentParser("D²CD-SAR evaluation")
     parser.add_argument("--checkpoint", required=True, type=str,
                         help="Path to deploy_student.pth or best.pth")
     parser.add_argument("--dataset", default="ssdd", choices=["ssdd", "hrsid"])
     parser.add_argument("--data-root", default=None, type=str)
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
-    parser.add_argument("--output-dir", default="./outputs/sar_rtdetr/eval", type=str)
+    parser.add_argument("--output-dir", default="./outputs/d2cd_sar/eval", type=str)
     parser.add_argument("--img-size", default=896, type=int)
     parser.add_argument("--batch-size", default=1, type=int)
     parser.add_argument("--num-classes", default=1, type=int)

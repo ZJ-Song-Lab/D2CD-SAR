@@ -5,7 +5,7 @@
 
 r"""DRCP: Depth-Routed Cross-Modal Purifier.
 
-Implements the feature-level alignment module of the SAR-RTDETR paper.
+Implements the feature-level alignment module of the D²CD-SAR paper.
 
 Phase 1 - Depth-wise Semantic Routing (Eq. 3-5):
   Student levels U = {S3, S4, F5} interpolated to the teacher spatial

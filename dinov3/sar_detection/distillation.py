@@ -3,9 +3,9 @@
 # This software may be used and distributed in accordance with the
 # terms of the DINOv3 License Agreement.
 
-"""SAR-RTDETR cross-modal knowledge distiller.
+"""D²CD-SAR cross-modal knowledge distiller.
 
-Wires together the three components of the SAR-RTDETR paper:
+Wires together the three components of the D²CD-SAR paper:
   * a frozen DINOv3-ViT-Base semantic teacher (provides dense patch-level
     features F_tea^sp),
   * a lightweight RT-DETR-R18 student whose AIFI attention output

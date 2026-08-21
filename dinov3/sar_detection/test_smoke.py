@@ -3,7 +3,7 @@
 # This software may be used and distributed in accordance with the
 # terms of the DINOv3 License Agreement.
 
-"""Smoke tests for the SAR-RTDETR components.
+"""Smoke tests for the D²CD-SAR components.
 
 Run with::
 
