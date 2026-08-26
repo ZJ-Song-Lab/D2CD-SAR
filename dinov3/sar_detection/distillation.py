@@ -3,7 +3,7 @@
 # This software may be used and distributed in accordance with the
 # terms of the DINOv3 License Agreement.
 
-"""D²CD-SAR cross-modal knowledge distiller.
+"""D²CD-SAR cross-domain knowledge distiller.
 
 Wires together the three components of the D²CD-SAR paper:
   * a frozen DINOv3-ViT-Base semantic teacher (provides dense patch-level
@@ -34,8 +34,6 @@ import torch.distributed as dist
 
 from dinov3.hub.backbones import dinov3_vitb16, Weights
 from dinov3.sar_detection.atd_lora import (
-    collect_atd_params,
-    flattened_grad,
     total_orthogonal_loss,
     total_sparsity_loss,
 )

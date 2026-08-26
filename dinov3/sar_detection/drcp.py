@@ -37,7 +37,7 @@ from dinov3.layers.rms_norm import RMSNorm
 
 
 class DRCP(nn.Module):
-    """Depth-Routed Cross-Modal Purifier.
+    """Depth-Routed Cross-Domain Purifier.
 
     Args:
         C_t: teacher channel dimension (DINOv3-ViT-B -> 768).
@@ -56,7 +56,7 @@ class DRCP(nn.Module):
     def __init__(
         self,
         C_t: int = 768,
-        student_dims=(128, 256, 256),
+        student_dims=(256, 256, 256),
         K_window: int = 5,
         mu: float = 0.5,
         sigma: float = 4.0,
@@ -260,9 +260,9 @@ class DRCP(nn.Module):
         # before cosine normalization (paper Sec. 3.2, Eq. drcp_loss).
         a = f_tea_hat.flatten(2)  # [B, C_t, HW]
         b = f_stu_routed.flatten(2)  # [B, C_t, HW]
-        a_norm = a.norm(dim=1).clamp(min=1e-6)  # [B, HW]
-        b_norm = b.norm(dim=1).clamp(min=1e-6)  # [B, HW]
-        cos = (a * b).sum(dim=1) / (a_norm * b_norm)  # [B, HW]
+        a_norm = a.norm(dim=1)  # [B, HW]
+        b_norm = b.norm(dim=1)  # [B, HW]
+        cos = (a * b).sum(dim=1) / (a_norm * b_norm + 1e-8)  # Eq. stable_cosine_distance
         weight = w_soft.flatten(2).squeeze(1)  # [B, HW]
         loss = (weight * (1.0 - cos)).sum(dim=1) / (weight.sum(dim=1) + 1e-6)
         loss = loss.mean()

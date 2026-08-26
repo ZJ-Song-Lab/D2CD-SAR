@@ -95,7 +95,7 @@ class VarianceGate(nn.Module):
         self.num_seen += 1
         n = min(int(self.num_seen.item()), self.K)
         if n > 1:
-            sigma_r = self.r_buffer[:n].var(unbiased=False)
+            sigma_r = self.r_buffer[:n].var(unbiased=True)
         else:
             sigma_r = torch.zeros((), device=r.device)
 
@@ -124,10 +124,9 @@ class ATDLoRALinear(nn.Module):
     def __init__(
         self,
         base_linear: nn.Linear,
-        r_det: int = 16,
-        r_distill: int = 16,
+        r_det: int = 100,
+        r_distill: int = 100,
         gate: VarianceGate = None,
-        init_scale: float = 1e-3,
     ):
         super().__init__()
         self.in_features = base_linear.in_features
@@ -226,28 +225,6 @@ class ATDLoRALinear(nn.Module):
                 linear.bias.copy_(self.bias.detach())
         linear.eval()
         return linear
-
-
-def collect_atd_params(modules) -> list:
-    """Collect the AIFI LoRA parameters (theta_AIFI) for variance gating."""
-    params = []
-    for m in modules:
-        params.extend([
-            m.A_det, m.B_det, m.sigma_det,
-            m.A_distill, m.B_distill, m.sigma_distill,
-        ])
-    return params
-
-
-def flattened_grad(loss, params, retain_graph=True) -> torch.Tensor:
-    """Flattened gradient of ``loss`` w.r.t. ``params`` (no accumulation)."""
-    grads = torch.autograd.grad(loss, params, retain_graph=retain_graph, allow_unused=True)
-    flat = []
-    for g, p in zip(grads, params):
-        if g is None:
-            g = torch.zeros_like(p)
-        flat.append(g.detach().flatten())
-    return torch.cat(flat) if flat else torch.zeros(1)
 
 
 def total_orthogonal_loss(modules) -> torch.Tensor:
