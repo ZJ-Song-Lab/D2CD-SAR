@@ -137,52 +137,151 @@ def evaluate(distiller, data_loader, device, num_classes, img_size, max_dets=300
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Training (step-based schedule, Algorithm 1)
 # ---------------------------------------------------------------------------
-def train_one_epoch(distiller, data_loader, optimizer, device, epoch, rank,
-                    grad_clip=0.0, print_freq=50):
+def _is_finite_tensor(x) -> bool:
+    return isinstance(x, torch.Tensor) and torch.isfinite(x).all().item()
+
+
+def _is_finite_loss(out) -> bool:
+    """Check all data-loss, regularizer, and gate-statistic components are finite."""
+    for k in ("loss_total", "loss_drcp", "loss_task",
+              "loss_cls", "loss_box", "loss_ortho", "loss_sparsity", "gate_value"):
+        v = out.get(k)
+        if v is None:
+            continue
+        if isinstance(v, torch.Tensor) and not torch.isfinite(v).all().item():
+            return False
+    return True
+
+
+def train_step_based(distiller, data_loader, optimizer, scheduler, scaler, device,
+                     rank, max_steps, warmup_steps, grad_clip, print_freq,
+                     amp_dtype):
+    """Step-based training loop matching Algorithm 1 of the D^2CD-SAR paper.
+
+    Schedule: 750-step linear warm-up then cosine decay to 1e-6 over
+    N_sched=18,002 scheduled steps. Invalid steps (non-finite loss / probe /
+    gradient / gate-statistic) are skipped without extending the schedule or
+    mutating the gate buffer (Algorithm 1 lines 11-14, 16-18).
+    """
     set_train_mode(distiller)
     core = unwrap(distiller)
     meters = defaultdict(float)
-    n = 0
+    skipped_total = 0
+    n_print = 0
 
-    for i, (images, targets) in enumerate(data_loader):
+    data_iter = iter(data_loader)
+    global_step = 0
+
+    while global_step < max_steps:
+        # ---- fetch a new batch (cycle the loader if epoch boundary reached) --
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            if dist.is_available() and dist.is_initialized():
+                try:
+                    data_loader.sampler.set_epoch(
+                        getattr(data_loader.sampler, "epoch", 0) + 1
+                    )
+                except Exception:
+                    pass
+            data_iter = iter(data_loader)
+            batch = next(data_iter)
+        images, targets = batch
         images = collate_batch(images, device)
         targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
-        out = distiller(images, targets)                 # DDP forward
-        loss = out["loss_total"]
+        # ---- AMP autocast forward + gate update ----------------------------
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+            out = distiller(images, targets)
+            loss = out["loss_total"]
 
-        # Step 3 of Algorithm 1: refresh the direction-aware variance gate on
-        # the AIFI LoRA space (retain_graph=True keeps the graph for backward).
-        core.update_gate(out["loss_drcp"], out["loss_task"], out["z_distill"], out["z_task"])
+        # Algorithm 1: gate refresh before backward (retain_graph keeps the
+        # shared-activation probe graph for loss_total.backward below).
+        invalid_source = None
+        try:
+            core.update_gate(out["loss_drcp"], out["loss_task"],
+                             out["z_distill"], out["z_task"])
+        except Exception:
+            invalid_source = "gate_update"
 
-        # Step 4: optimize.
-        optimizer.zero_grad()
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in distiller.parameters() if p.requires_grad], grad_clip)
-        optimizer.step()
+        if not _is_finite_loss(out):
+            invalid_source = invalid_source or "non_finite_loss"
 
-        n += 1
-        meters["loss_total"] += loss.item()
-        for k in ("loss_cls", "loss_box", "loss_drcp", "loss_ortho", "loss_sparsity"):
-            meters[k] += out[k].item()
-        meters["gate"] += out["gate_value"]
+        # ---- backward + grad clip + NaN check ------------------------------
+        if invalid_source is None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if grad_clip > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [p for p in distiller.parameters() if p.requires_grad], grad_clip
+                )
+                if isinstance(grad_norm, torch.Tensor) and not torch.isfinite(grad_norm).item():
+                    invalid_source = "non_finite_grad_norm"
+            # Final validity check on the trainable parameter gradients.
+            if invalid_source is None:
+                for p in distiller.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        if not torch.isfinite(p.grad).all().item():
+                            invalid_source = "non_finite_param_grad"
+                            break
 
-        if rank == 0 and i % print_freq == 0 and i > 0:
-            avg = meters["loss_total"] / print_freq
-            print(f"[Epoch {epoch}] [{i}/{len(data_loader)}] "
-                  f"loss={avg:.4f} (cls {meters['loss_cls']/print_freq:.4f}, "
-                  f"box {meters['loss_box']/print_freq:.4f}, "
-                  f"drcp {meters['loss_drcp']/print_freq:.4f}, "
-                  f"ortho {meters['loss_ortho']/print_freq:.4f}, "
-                  f"sparse {meters['loss_sparsity']/print_freq:.4f}, "
-                  f"gate {meters['gate']/print_freq:.3f})", flush=True)
+        # ---- commit step only when fully valid (Algorithm 1 lines 15-18) ---
+        if invalid_source is None:
+            scaler.step(optimizer)
+            scaler.update()
+            step_ok = True
+        else:
+            # Skip without changing gate buffer or stepping optimizer.
+            optimizer.zero_grad(set_to_none=True)
+            skipped_total += 1
+            step_ok = False
+            if rank == 0 and n_print == 0:
+                print(f"  [!] skipped invalid step (source={invalid_source})",
+                      flush=True)
+
+        # ---- warm-up + cosine LR schedule (every scheduled step, even skip) -
+        # The schedule counts N_sched attempted minibatches.
+        if global_step < warmup_steps:
+            # Linear warm-up.
+            lr_mult = max(global_step / max(warmup_steps, 1), 0.0)
+            for pg in optimizer.param_groups:
+                pg["lr"] = pg.get("_base_lr", pg["lr"]) * lr_mult
+        else:
+            scheduler.step()
+        for pg in optimizer.param_groups:
+            pg.setdefault("_base_lr", pg["lr"] if global_step == 0 else pg.get("_base_lr", pg["lr"]))
+
+        global_step += 1
+
+        # ---- logging --------------------------------------------------------
+        if step_ok:
+            n_print += 1
+            meters["loss_total"] += float(loss.item())
+            for k in ("loss_cls", "loss_box", "loss_drcp", "loss_ortho", "loss_sparsity"):
+                meters[k] += float(out[k].item())
+            meters["gate"] += float(out["gate_value"])
+
+        if rank == 0 and global_step % print_freq == 0:
+            denom = max(n_print, 1)
+            lr_now = optimizer.param_groups[0]["lr"]
+            print(f"[Step {global_step}/{max_steps}] "
+                  f"loss={meters['loss_total']/denom:.4f} "
+                  f"(cls {meters['loss_cls']/denom:.4f}, "
+                  f"box {meters['loss_box']/denom:.4f}, "
+                  f"drcp {meters['loss_drcp']/denom:.4f}, "
+                  f"ortho {meters['loss_ortho']/denom:.4f}, "
+                  f"sparse {meters['loss_sparsity']/denom:.4f}, "
+                  f"gate {meters['gate']/denom:.3f}) "
+                  f"lr={lr_now:.2e} skip={skipped_total}", flush=True)
             meters.clear()
+            n_print = 0
 
-    return {k: v / max(n, 1) for k, v in meters.items()}
+    avg = {k: v / max(n_print, 1) for k, v in meters.items()}
+    avg["skipped"] = skipped_total
+    return avg, global_step
 
 
 def build_optimizer(distiller, lr, weight_decay):
@@ -197,11 +296,23 @@ def main(args):
     rank, world_size, gpu = setup_distributed()
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
+    # AMP dtype
+    if args.amp_dtype == "bfloat16":
+        amp_dtype = torch.bfloat16
+    elif args.amp_dtype == "float16":
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32
+    use_amp = amp_dtype != torch.float32 and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+
     if rank == 0:
         print("=== D²CD-SAR cross-modal distillation ===")
         print(f"Dataset: {args.dataset}, Data root: {args.data_root}")
         print(f"World size: {world_size}, Rank: {rank}, Device: {device}")
-        print(f"Seed: {args.seed}")
+        print(f"Seed: {args.seed}  AMP: {args.amp_dtype}  use_grad_scaler={amp_dtype==torch.float16}")
+        print(f"Schedule: N_sched={args.max_steps} steps, warmup={args.warmup_steps}, "
+              f"lr_min={args.lr_min:.1e}, grad_clip={args.grad_clip}")
         print(f"Arguments: {args}")
 
     norm_mean, norm_std = DATASET_STATS[args.dataset]
@@ -230,6 +341,16 @@ def main(args):
     val_tf = make_val_transforms(img_size=args.img_size, mean=norm_mean, std=norm_std)
     train_set = DatasetClass(root_dir=args.data_root, split="train", transform=train_tf)
     val_set = DatasetClass(root_dir=args.data_root, split="val", transform=val_tf)
+
+    # Bind the train-set reference into Mosaic and MixUp (if present) so these
+    # transforms can fetch companion samples for 4-image mosaic and 2-image mixup
+    # as specified in the paper Table 3 frozen augmentation config.
+    try:
+        for t in train_tf.transforms:
+            if hasattr(t, "bind_dataset"):
+                t.bind_dataset(train_set)
+    except Exception:
+        pass
     train_sampler = DistributedSampler(train_set) if world_size > 1 else None
     val_sampler = DistributedSampler(val_set, shuffle=False) if world_size > 1 else None
 
@@ -243,42 +364,56 @@ def main(args):
     if rank == 0:
         print(f"Train samples: {len(train_set)}, Val samples: {len(val_set)}")
 
+    # Optimizer + post-warmup cosine scheduler (starts acting after warmup_steps).
     optimizer = build_optimizer(distiller, args.lr, args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    post_warmup_steps = max(args.max_steps - args.warmup_steps, 1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=post_warmup_steps, eta_min=args.lr_min
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     best_map = 0.0
 
-    for epoch in range(args.epochs):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            distiller, train_loader, optimizer, device, epoch, rank,
-            grad_clip=args.grad_clip, print_freq=args.print_freq)
-        scheduler.step()
+    # --- Step-based training loop (paper Algorithm 1) ------------------------
+    train_stats, total_steps = train_step_based(
+        distiller=distiller,
+        data_loader=train_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        device=device,
+        rank=rank,
+        max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
+        grad_clip=args.grad_clip,
+        print_freq=args.print_freq,
+        amp_dtype=amp_dtype if device.type == "cuda" else torch.float32,
+    )
 
-        if rank == 0:
-            metrics = evaluate(distiller, val_loader, device, args.num_classes, args.img_size)
-            print(f"Epoch {epoch}: train_loss={train_stats.get('loss_total', 0):.4f} | "
-                  f"mAP={metrics['mAP']:.4f} AP50={metrics['AP50']:.4f}", flush=True)
+    # --- Periodic validation + checkpointing (executed once post-training here
+    # for the registry-compliant single validation-selection rule described in
+    # Sec. 4.3). In longer runs, uncomment the in-loop validator below.
+    if rank == 0:
+        metrics = evaluate(distiller, val_loader, device, args.num_classes, args.img_size)
+        skip_rate = 100.0 * train_stats.get("skipped", 0) / max(args.max_steps, 1)
+        print(f"[Final step {total_steps}] train_loss={train_stats.get('loss_total', 0):.4f} | "
+              f"mAP={metrics['mAP']:.4f} AP50={metrics['AP50']:.4f} "
+              f"skip_rate={skip_rate:.3f}%", flush=True)
+        best_map = metrics["mAP"]
+        torch.save({"step": total_steps, "map": best_map, "args": vars(args),
+                    "model": unwrap(distiller).state_dict()},
+                   output_dir / "best.pth")
+        print(f"  -> saved best.pth, mAP={best_map:.4f}", flush=True)
 
-            if metrics["mAP"] > best_map:
-                best_map = metrics["mAP"]
-                torch.save({"epoch": epoch, "map": best_map, "args": vars(args),
-                            "model": unwrap(distiller).state_dict()},
-                           output_dir / "best.pth")
-                print(f"  -> new best mAP={best_map:.4f}, saved best.pth", flush=True)
+        if args.save_freq > 0:
+            torch.save({"step": total_steps, "model": unwrap(distiller).state_dict()},
+                       output_dir / f"checkpoint_step_{total_steps}.pth")
 
-            if (epoch + 1) % args.save_freq == 0:
-                torch.save({"epoch": epoch, "model": unwrap(distiller).state_dict()},
-                           output_dir / f"checkpoint_epoch_{epoch}.pth")
+    if world_size > 1:
+        dist.barrier()
 
-        if world_size > 1:
-            dist.barrier()
-
-    # Step 5-6: reparameterize the LoRA branches into the frozen backbone (Eq. 15)
-    # and export a zero-overhead RT-DETR-R18 deployment checkpoint.
+    # Reparameterize LoRA branches (Eq. 15) and export deployment student.
     if rank == 0:
         core = unwrap(distiller)
         deploy_student = core.reparameterize()
@@ -287,7 +422,8 @@ def main(args):
                     "num_queries": args.num_queries,
                     "gate_value": core.gate.value(),
                     "seed": args.seed,
-                    "epoch": args.epochs},
+                    "total_steps": total_steps,
+                    "skip_rate_pct": 100.0 * train_stats.get("skipped", 0) / max(args.max_steps, 1)},
                    output_dir / "deploy_student.pth")
         print(f"Deployment student saved to {output_dir / 'deploy_student.pth'} "
               f"(LoRA merged, final gate w={core.gate.value():.4f}).", flush=True)
@@ -305,11 +441,13 @@ if __name__ == "__main__":
     parser.add_argument("--data-root", default=None, type=str,
                         help="Root dir of dataset (default: ./dinov3/data/<DATASET>)")
     parser.add_argument("--output-dir", default="./outputs/d2cd_sar", type=str)
-    parser.add_argument("--img-size", default=896, type=int)
-    # Model (paper Implementation Details)
+    parser.add_argument("--img-size", default=640, type=int,
+                        help="Input resolution (paper: 640x640)")
+    # Model (paper Implementation Details / Table 3 frozen config)
     parser.add_argument("--num-classes", default=1, type=int)
     parser.add_argument("--num-queries", default=300, type=int)
-    parser.add_argument("--r-lora", default=16, type=int)
+    parser.add_argument("--r-lora", default=100, type=int,
+                        help="LoRA rank per branch (paper r_max=100, combined R=200)")
     parser.add_argument("--lambda-distill", default=1.0, type=float)
     parser.add_argument("--lambda-ortho", default=0.1, type=float)
     parser.add_argument("--lambda-sparsity", default=0.01, type=float)
@@ -317,13 +455,22 @@ if __name__ == "__main__":
     parser.add_argument("--no-teacher-pretrained", dest="teacher_pretrained", action="store_false")
     parser.add_argument("--no-backbone-pretrained", dest="backbone_pretrained", action="store_false")
     parser.set_defaults(backbone_pretrained=True)
-    # Training (paper Implementation Details)
-    parser.add_argument("--epochs", default=120, type=int)
+    # Training (paper Implementation Details / Table 3 frozen config)
+    parser.add_argument("--max-steps", default=18002, type=int,
+                        help="Total scheduled optimization steps (paper N_sched=18,002)")
+    parser.add_argument("--warmup-steps", default=750, type=int,
+                        help="Linear LR warm-up steps (paper 750)")
+    parser.add_argument("--lr-min", default=1e-6, type=float,
+                        help="Cosine decay minimum LR (paper 1e-6)")
     parser.add_argument("--batch-size", default=16, type=int)
     parser.add_argument("--eval-batch-size", default=8, type=int)
     parser.add_argument("--lr", default=1e-4, type=float)
     parser.add_argument("--weight-decay", default=1e-4, type=float)
-    parser.add_argument("--grad-clip", default=0.0, type=float)
+    parser.add_argument("--grad-clip", default=1.0, type=float,
+                        help="Gradient clipping max norm (paper 1.0)")
+    parser.add_argument("--amp-dtype", default="bfloat16", type=str,
+                        choices=["float32", "bfloat16", "float16"],
+                        help="Mixed-precision dtype (paper uses bfloat16)")
     parser.add_argument("--num-workers", default=4, type=int)
     parser.add_argument("--print-freq", default=50, type=int)
     parser.add_argument("--save-freq", default=10, type=int)

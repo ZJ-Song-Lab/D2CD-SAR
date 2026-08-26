@@ -1,5 +1,5 @@
 #!/bin/bash
-# Evaluation script for SAR-RTDETR deployment model.
+# Evaluation script for D2CD-SAR deployment model.
 #
 # Produces the reproducibility artifacts referenced in the paper's Experiment
 # section:
@@ -11,11 +11,11 @@
 set -e
 
 # Default configurations
-CHECKPOINT="${CHECKPOINT:-./outputs/sar_rtdetr/deploy_student.pth}"
+CHECKPOINT="${CHECKPOINT:-./outputs/d2cd_sar/deploy_student.pth}"
 DATASET="${DATASET:-ssdd}"
 DATA_ROOT="${DATA_ROOT:-./dinov3/data/SSDD}"
 SPLIT="${SPLIT:-val}"
-OUTPUT_DIR="${OUTPUT_DIR:-./outputs/sar_rtdetr/eval}"
+OUTPUT_DIR="${OUTPUT_DIR:-./outputs/d2cd_sar/eval}"
 IMG_SIZE="${IMG_SIZE:-896}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 SEEDS="${SEEDS:-42,123,2024}"
@@ -23,7 +23,7 @@ CONF_THRESHOLD="${CONF_THRESHOLD:-0.0}"
 
 # Print configuration
 echo "========================================"
-echo "SAR-RTDETR Evaluation"
+echo "D2CD-SAR Evaluation"
 echo "========================================"
 echo "Checkpoint: $CHECKPOINT"
 echo "Dataset: $DATASET"

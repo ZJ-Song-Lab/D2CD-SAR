@@ -30,6 +30,7 @@ to the shared AIFI input activation x^(t) (Eq. activation_probes), not the
 LoRA parameter union.
 """
 
+import math
 from collections import deque
 
 import torch
@@ -141,13 +142,15 @@ class ATDLoRALinear(nn.Module):
         else:
             self.bias = None
 
-        # Detection branch: B zero-init => zero contribution at start.
-        self.A_det = nn.Parameter(torch.randn(r_det, self.in_features) * init_scale)
+        # Detection branch: A with Kaiming uniform (paper Table 3), B zero-init.
+        self.A_det = nn.Parameter(torch.empty(r_det, self.in_features))
+        nn.init.kaiming_uniform_(self.A_det, a=math.sqrt(5))
         self.B_det = nn.Parameter(torch.zeros(self.out_features, r_det))
         self.sigma_det = nn.Parameter(torch.ones(r_det))
 
-        # Distillation branch: B zero-init => zero contribution at start.
-        self.A_distill = nn.Parameter(torch.randn(r_distill, self.in_features) * init_scale)
+        # Distillation branch: A with Kaiming uniform (paper Table 3), B zero-init.
+        self.A_distill = nn.Parameter(torch.empty(r_distill, self.in_features))
+        nn.init.kaiming_uniform_(self.A_distill, a=math.sqrt(5))
         self.B_distill = nn.Parameter(torch.zeros(self.out_features, r_distill))
         self.sigma_distill = nn.Parameter(torch.ones(r_distill))
 

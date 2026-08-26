@@ -48,7 +48,7 @@ SSDD_MEAN = (0.430, 0.411, 0.296)
 SSDD_STD = (0.213, 0.156, 0.143)
 
 
-class SARRTDETRDistiller(nn.Module):
+class D2CDSARDistiller(nn.Module):
     """Cross-modal distillation container (teacher + student + DRCP + gate)."""
 
     def __init__(
@@ -95,10 +95,15 @@ class SARRTDETRDistiller(nn.Module):
         # Teacher features are used directly at C_t=768.
 
         # --- DRCP (feature-level alignment) ---
+        # Paper Table 3 frozen config: Student projectors 3x(256->768).
+        # The routed levels {S_3, S_4, F_5} are mapped through the student's
+        # own 1x1 input_proj layers into the common d_model=256 interface,
+        # then DRCP's three 1x1 convs project 256 -> C_t=768.
+        d_model = self.student.d_model  # 256
         drcp_kwargs = dict(drcp_kwargs or {})
         self.drcp = DRCP(
             C_t=self.embed_dim,
-            student_dims=(self.student.backbone.dims[0], self.student.backbone.dims[1], self.student.d_model),
+            student_dims=(d_model, d_model, d_model),  # 3x 256 -> 768
             **drcp_kwargs,
         )
 
@@ -221,10 +226,17 @@ class SARRTDETRDistiller(nn.Module):
         outputs_distill = self.student(
             images, detach_det=True, backbone_features=(s3, s4, s5)
         )
+        # Paper Table 3 frozen config: 3x(256->768) DRCP student projectors.
+        # Map the raw backbone levels S_3, S_4 through the student's own
+        # 1x1 input_proj to the common d_model=256 interface before alignment.
+        # F_5 is already at d_model (it is the AIFI-refined projected S_5).
+        p3 = self.student.input_proj[0](outputs_distill["s3"])   # 128 -> 256
+        p4 = self.student.input_proj[1](outputs_distill["s4"])   # 256 -> 256
+        f5 = outputs_distill["f5"]                                # already 256
         sar_gray = self._sar_intensity(images)
         hbb_norm = self._normalize_hbb_for_drcp(targets, H, W)
         f_tea_hat, loss_drcp = self.drcp(
-            [outputs_distill["s3"], outputs_distill["s4"], outputs_distill["f5"]],
+            [p3, p4, f5],
             teacher_features,
             hbb_norm,
             sar_gray,
@@ -293,20 +305,20 @@ class SARRTDETRDistiller(nn.Module):
     def reparameterize(self):
         """Merge both LoRA branches into the frozen AIFI weights (Eq. 15).
 
-        After this call the student's AIFI holds plain ``nn.Linear`` layers (zero
-        extra inference cost / memory). The teacher, DRCP and gate can then be
-        discarded, leaving a pristine RT-DETR-R18.
+        The A^2TD-LoRA module is injected at ``self_attn.out_proj`` of each
+        AIFI encoder layer (paper Table 3). Merging returns a plain
+        ``nn.Linear`` so the exported detector has zero extra inference cost.
+        The teacher, DRCP, gate, and probes are then discarded.
         """
         for layer in self.student.aifi.layers:
-            layer.linear1 = layer.linear1.merge()
-            layer.linear2 = layer.linear2.merge()
+            layer.attn_out_proj = layer.attn_out_proj.merge()
         return self.student
 
 
 def build_distiller(
     num_classes: int = 1,
     num_queries: int = 300,
-    r_lora: int = 16,
+    r_lora: int = 100,
     lambda_distill: float = 1.0,
     lambda_ortho: float = 0.1,
     lambda_sparsity: float = 0.01,
@@ -318,8 +330,16 @@ def build_distiller(
     norm_mean=SSDD_MEAN,
     norm_std=SSDD_STD,
 ):
-    """Factory with the paper's default hyperparameters (Implementation Details)."""
-    distiller = SARRTDETRDistiller(
+    """Factory with the paper's default hyperparameters (Table 3 frozen config).
+
+    Defaults match the D^2CD-SAR paper:
+      * r_lora=100 per branch (combined R=200) for the A^2TD-LoRA injection at
+        ``self_attn.out_proj.weight``.
+      * DRCP student projectors are 3x(256->768), i.e. the routed student
+        levels {S_3, S_4, F_5} are first mapped to a common 256-channel
+        interface (RT-DETR ``input_proj``) before alignment projection.
+    """
+    distiller = D2CDSARDistiller(
         num_classes=num_classes,
         num_queries=num_queries,
         r_lora=r_lora,
