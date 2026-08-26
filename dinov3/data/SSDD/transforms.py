@@ -334,7 +334,7 @@ class ToTensor:
 
 
 class Normalize:
-    """Normalize for DINOv3 satellite model"""
+    """Normalize for D²CD-SAR SAR ship detection"""
 
     def __init__(self, mean=(0.430, 0.411, 0.296), std=(0.213, 0.156, 0.143)):
         self.mean = mean

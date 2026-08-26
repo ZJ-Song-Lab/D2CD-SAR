@@ -268,12 +268,10 @@ class D2CDSARDistiller(nn.Module):
         }
 
     # --------------------------------------------------- variance gate update
-    def update_gate(self, loss_drcp: torch.Tensor, loss_task: torch.Tensor,
-                    z_distill: torch.Tensor, z_task: torch.Tensor) -> float:
-        """Refresh the direction-aware variance gate on the shared AIFI input z.
+    def compute_gate_candidate(self, loss_drcp: torch.Tensor, loss_task: torch.Tensor,
+                               z_distill: torch.Tensor, z_task: torch.Tensor) -> dict:
+        """Compute the gate candidate WITHOUT committing (Algorithm 1 Line 6).
 
-        Implements Eq. (8)-(11): activation-cosine direction agreement ``c_dir``,
-        direction-aware ratio ``r``, adaptive momentum ``alpha`` and EMA ``w``.
         Probes are gradients of L_task and L_DRCP w.r.t. the common AIFI input
         activation z (Eq. activation_probes), computed with ``retain_graph=True``
         so the graph is still available for ``loss_total.backward()``.
@@ -296,7 +294,14 @@ class D2CDSARDistiller(nn.Module):
                 dist.all_reduce(p_task, op=dist.ReduceOp.SUM)
                 p_distill = p_distill / world_size
                 p_task = p_task / world_size
-        return self.gate.update(p_distill, p_task)
+        return self.gate.compute_candidate(p_distill, p_task)
+
+    def commit_gate(self, candidate: dict) -> float:
+        """Commit the gate candidate to buffer state (Algorithm 1 Line 19).
+
+        Only call this after all loss/probe/gradient validity checks pass.
+        """
+        return self.gate.commit(candidate)
 
     # --------------------------------------------------------- deployment
     @torch.no_grad()

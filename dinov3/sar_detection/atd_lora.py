@@ -69,12 +69,18 @@ class VarianceGate(nn.Module):
         self.register_buffer("num_seen", torch.zeros(1, dtype=torch.long))
 
     @torch.no_grad()
-    def update(self, p_distill: torch.Tensor, p_task: torch.Tensor, eps: float = 1e-8) -> float:
-        """Push one observation and return the updated gate value.
+    def compute_candidate(self, p_distill: torch.Tensor, p_task: torch.Tensor, eps: float = 1e-8) -> dict:
+        """Compute the next gate candidate WITHOUT modifying any buffer state.
+
+        Paper Algorithm 1 Line 6: "form the next-step gate candidate from the
+        valid history."  The candidate is committed later by :meth:`commit`
+        only after all loss/probe/gradient checks pass (Lines 11-18).
 
         Args:
             p_distill: gradient of L_DRCP w.r.t. the shared AIFI input z.
             p_task: gradient of L_task w.r.t. the shared AIFI input z.
+        Returns:
+            dict with keys: w_new, r, idx, num_seen_new, n_new, sigma_r.
         """
         p_d = p_distill.detach().flatten()
         p_t = p_task.detach().flatten()
@@ -89,22 +95,39 @@ class VarianceGate(nn.Module):
         ratio = ratio.clamp(0.0, self.r_max)
         r = (ratio * c).clamp(0.0, 1.0)
 
-        # Update sliding buffer and compute local sample variance sigma_r.
+        # Compute candidate buffer position and new count.
         idx = int(self.num_seen.item()) % self.K
+        num_seen_new = int(self.num_seen.item()) + 1
+        n = min(num_seen_new, self.K)
+
+        # Temporarily place r into the buffer slot to compute variance.
+        old_val = self.r_buffer[idx].item()
         self.r_buffer[idx] = r
-        self.num_seen += 1
-        n = min(int(self.num_seen.item()), self.K)
         if n > 1:
             sigma_r = self.r_buffer[:n].var(unbiased=True)
         else:
             sigma_r = torch.zeros((), device=r.device)
+        # Restore the old value — commit will write it for real.
+        self.r_buffer[idx] = old_val
 
         # Eq.(10): adaptive smoothing factor alpha.
         alpha = (self.alpha_base + self.gamma * torch.tanh(sigma_r)).clamp(0.0, self.alpha_max)
 
         # Eq.(11): dynamic EMA gating scalar w.
         w_new = alpha * self.gate + (1.0 - alpha) * r
-        self.gate.copy_(w_new.detach())
+
+        return {"w_new": w_new.detach(), "r": r.detach(), "idx": idx,
+                "num_seen_new": num_seen_new, "n": n}
+
+    @torch.no_grad()
+    def commit(self, candidate: dict) -> float:
+        """Commit the candidate to buffer state (Algorithm 1 Line 19).
+
+        Only call this after all loss/probe/gradient validity checks pass.
+        """
+        self.r_buffer[candidate["idx"]] = candidate["r"]
+        self.num_seen.fill_(candidate["num_seen_new"])
+        self.gate.copy_(candidate["w_new"])
         return float(self.gate.item())
 
     def value(self) -> float:

@@ -192,18 +192,19 @@ def train_step_based(distiller, data_loader, optimizer, scheduler, scaler, devic
         images = collate_batch(images, device)
         targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
-        # ---- AMP autocast forward + gate update ----------------------------
+        # ---- AMP autocast forward + gate candidate -------------------------
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
             out = distiller(images, targets)
             loss = out["loss_total"]
 
-        # Algorithm 1: gate refresh before backward (retain_graph keeps the
-        # shared-activation probe graph for loss_total.backward below).
+        # Algorithm 1 Line 6: probe gradients → compute gate candidate (DO NOT commit yet).
+        gate_candidate = None
         invalid_source = None
         try:
-            core.update_gate(out["loss_drcp"], out["loss_task"],
-                             out["z_distill"], out["z_task"])
+            gate_candidate = core.compute_gate_candidate(
+                out["loss_drcp"], out["loss_task"],
+                out["z_distill"], out["z_task"])
         except Exception:
             invalid_source = "gate_update"
 
@@ -228,11 +229,15 @@ def train_step_based(distiller, data_loader, optimizer, scheduler, scaler, devic
                             invalid_source = "non_finite_param_grad"
                             break
 
-        # ---- commit step only when fully valid (Algorithm 1 lines 15-18) ---
+        # ---- commit step only when fully valid (Algorithm 1 Line 19) ------
         if invalid_source is None:
             scaler.step(optimizer)
             scaler.update()
             step_ok = True
+            # Algorithm 1 Line 19: commit gate state and buffer only after
+            # all loss/probe/gradient checks pass.
+            if gate_candidate is not None:
+                core.commit_gate(gate_candidate)
         else:
             # Skip without changing gate buffer or stepping optimizer.
             optimizer.zero_grad(set_to_none=True)
@@ -244,15 +249,18 @@ def train_step_based(distiller, data_loader, optimizer, scheduler, scaler, devic
 
         # ---- warm-up + cosine LR schedule (every scheduled step, even skip) -
         # The schedule counts N_sched attempted minibatches.
+        # Save base LR BEFORE any adjustment to avoid clobbering with lr=0
+        # at step 0 (warmup multiplier is 0 at the first step).
+        if global_step == 0:
+            for pg in optimizer.param_groups:
+                pg.setdefault("_base_lr", pg["lr"])
         if global_step < warmup_steps:
             # Linear warm-up.
             lr_mult = max(global_step / max(warmup_steps, 1), 0.0)
             for pg in optimizer.param_groups:
-                pg["lr"] = pg.get("_base_lr", pg["lr"]) * lr_mult
+                pg["lr"] = pg["_base_lr"] * lr_mult
         else:
             scheduler.step()
-        for pg in optimizer.param_groups:
-            pg.setdefault("_base_lr", pg["lr"] if global_step == 0 else pg.get("_base_lr", pg["lr"]))
 
         global_step += 1
 

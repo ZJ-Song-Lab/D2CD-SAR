@@ -136,7 +136,10 @@ def test_variance_gate():
     assert abs(gate.value() - 1.0) < 1e-6
     p_distill = torch.randn(10)
     p_task = torch.randn(10)
-    w = gate.update(p_distill, p_task)
+    candidate = gate.compute_candidate(p_distill, p_task)
+    # Gate should NOT change before commit.
+    assert abs(gate.value() - 1.0) < 1e-6
+    w = gate.commit(candidate)
     assert 0.0 <= w <= 1.0
     print(f"[OK] test_variance_gate: w={w:.4f}")
 
