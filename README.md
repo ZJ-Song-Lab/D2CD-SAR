@@ -11,7 +11,7 @@
 
 **D²CD-SAR** transfers dense features from a **frozen DINOv3 teacher** to an **RT-DETR-R18 student** via a unified decoupling strategy:
 
-- **DRCP** (Depth-Routed Cross-Modal Purifier) — multi-level routing `{S3, S4, F5}` + channel/spatial weighting
+- **DRCP** (Depth-Routed Cross-Domain Purifier) — multi-level routing `{S3, S4, F5}` + channel/spatial weighting
 - **A²TD-LoRA** (Adaptive Task-Decoupled Orthogonal LoRA) — two low-rank branches on the AIFI attention output projection with activation-cosine direction gating
 - **Deployment** — teacher, DRCP, and gate are discarded; LoRA branches merged into the student graph
 
@@ -132,7 +132,7 @@ dinov3-main/
 │   │   ├── rtdetr.py             # RT-DETR-R18 student (query selection + AIFI)
 │   │   ├── drcp.py               # Depth-Routed Cross-Modal Purifier
 │   │   ├── atd_lora.py           # Adaptive Task-Decoupled Orthogonal LoRA
-│   │   ├── distillation.py       # Cross-modal distillation framework
+│   │   ├── distillation.py       # Cross-domain distillation framework
 │   │   └── test_smoke.py         # Smoke tests
 │   └── data/
 │       ├── SSDD/                 # SAR Ship Detection Dataset (HBB)

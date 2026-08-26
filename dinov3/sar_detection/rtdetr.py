@@ -467,6 +467,10 @@ class SetCriterion(nn.Module):
         losses = {}
         losses.update(self.loss_labels(outputs, targets, indices))
         losses.update(self.loss_boxes(outputs, targets, indices, num_boxes))
+        # Apply weight_dict (RT-DETR standard: loss_ce=1, loss_bbox=5, loss_giou=2).
+        for k in list(losses.keys()):
+            if k in self.weight_dict:
+                losses[k] = losses[k] * self.weight_dict[k]
         return losses
 
 

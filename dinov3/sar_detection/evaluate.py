@@ -31,7 +31,8 @@ Multiple seeds (aggregates mean ± std)::
     python -m dinov3.sar_detection.evaluate \
         --checkpoint outputs/d2cd_sar/deploy_student.pth \
         --dataset ssdd --data-root ./dinov3/data/SSDD \
-        --split val --seeds 42,123,2024 --output-dir outputs/d2cd_sar/eval
+        --split val --seeds 42,123,456,789,1024,2048,3072,4096,5120,6144 \
+        --output-dir outputs/d2cd_sar/eval
 """
 
 import argparse
@@ -78,7 +79,7 @@ def _compute_map_coco(gt_by_img, det_list, num_classes, device, max_dets=300):
     for iid, gt in gt_by_img.items():
         boxes = gt["boxes"].cpu()
         labels = gt["labels"].cpu()
-        H = W = 896  # default; area-based AP not used for primary endpoints
+        H = W = 640  # paper Table 3: 640x640 inputs
         images.append({"id": int(iid), "width": W, "height": H})
         for b in range(boxes.shape[0]):
             cx, cy, w, h = boxes[b].tolist()
@@ -214,7 +215,7 @@ def compute_map(gt_by_img, det_list, num_classes, device, max_dets=300):
 # Checkpoint loading
 # ---------------------------------------------------------------------------
 def load_student(checkpoint_path, device, num_classes=1, num_queries=300,
-                 r_lora=16):
+                 r_lora=100):
     """Load a deployment or training checkpoint into an RTDETRStudent.
 
     ``deploy_student.pth`` stores only the merged student weights (the LoRA
@@ -432,8 +433,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-queries", default=300, type=int)
     parser.add_argument("--r-lora", default=16, type=int)
     parser.add_argument("--num-workers", default=4, type=int)
-    parser.add_argument("--seeds", default="42", type=str,
-                        help="Comma-separated seeds (e.g. 42,123,2024)")
+    parser.add_argument("--seeds", default="42,123,456,789,1024,2048,3072,4096,5120,6144", type=str,
+                        help="Comma-separated seeds (paper Sec 4.3)")
     parser.add_argument("--warmup", default=3, type=int,
                         help="Warm-up batches before timing latency")
     parser.add_argument("--conf-threshold", default=0.0, type=float,

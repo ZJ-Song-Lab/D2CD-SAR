@@ -47,7 +47,7 @@ SSDD_STD = (0.213, 0.156, 0.143)
 
 
 class D2CDSARDistiller(nn.Module):
-    """Cross-modal distillation container (teacher + student + DRCP + gate)."""
+    """Cross-domain distillation container (teacher + student + DRCP + gate)."""
 
     def __init__(
         self,

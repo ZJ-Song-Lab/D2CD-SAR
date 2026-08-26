@@ -315,7 +315,7 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
     if rank == 0:
-        print("=== D²CD-SAR cross-modal distillation ===")
+        print("=== D²CD-SAR cross-domain distillation ===")
         print(f"Dataset: {args.dataset}, Data root: {args.data_root}")
         print(f"World size: {world_size}, Rank: {rank}, Device: {device}")
         print(f"Seed: {args.seed}  AMP: {args.amp_dtype}  use_grad_scaler={amp_dtype==torch.float16}")
